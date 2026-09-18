@@ -66,6 +66,26 @@ async def get_child_owned_by_user(db: AsyncSession, child_id: int, user_id: UUID
     return result.scalar_one_or_none()
 
 
+async def update_child_name(db: AsyncSession, child: Child, name: str) -> Child:
+    """Renombra un hijo ya validado como propio del usuario (ver get_child_owned_by_user)."""
+    child.name = name
+    await db.commit()
+    await db.refresh(child)
+    return child
+
+
+async def delete_child(db: AsyncSession, child: Child) -> None:
+    """
+    Borra el hijo (y, por ON DELETE CASCADE, sus documentos y turnos en la
+    base de datos). IMPORTANTE: esto NO borra los archivos en Google Drive ni
+    los eventos en Google Calendar -- eso lo tiene que hacer el llamador
+    ANTES de invocar esta función (ver borrar_hijo en main.py), porque acá
+    solo se toca la base de datos.
+    """
+    await db.delete(child)
+    await db.commit()
+
+
 # ---------- Documentos ----------
 
 def compute_status(expiry_date: Optional[date]) -> str:

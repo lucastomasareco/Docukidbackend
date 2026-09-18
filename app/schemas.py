@@ -24,6 +24,10 @@ class ChildCreate(BaseModel):
     birth_date: Optional[date] = None
 
 
+class ChildUpdate(BaseModel):
+    name: str
+
+
 class ChildOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)  # permite construirlo desde el modelo de SQLAlchemy
 

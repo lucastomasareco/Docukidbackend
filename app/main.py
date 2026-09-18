@@ -11,6 +11,8 @@ GET    /auth/google/url        -> genera la URL de autorización de Google (Fase
 GET    /auth/google/callback   -> recibe la respuesta de Google y guarda el refresh_token (Fase 2, paso 1)
 GET    /children               -> lista los hijos del usuario logueado
 POST   /children               -> crea un hijo nuevo
+PUT    /children/{child_id}    -> renombra un hijo
+DELETE /children/{child_id}    -> borra un hijo entero (documentos en Drive, turnos en Calendar y metadatos)
 POST   /upload                 -> "sube" un documento (todavía simulado)
 GET    /documents/{child_id}   -> lista documentos de un hijo, con status calculado
 DELETE /documents/{doc_id}     -> borra un documento
@@ -32,7 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 from . import crud
 from .auth import get_current_user
-from .calendar_sync import crear_evento
+from .calendar_sync import crear_evento, borrar_evento
 from .database import get_db
 from .drive_upload import delete_file_from_drive, upload_file_to_drive
 from .google_oauth import router as google_oauth_router
@@ -48,6 +50,7 @@ from .schemas import (
     ChildOut,
     ChildResponse,
     ChildrenResponse,
+    ChildUpdate,
     DeleteResponse,
     DocumentOut,
     DocumentsResponse,
@@ -92,6 +95,59 @@ async def crear_hijo(
 ):
     hijo = await crud.create_child(db, usuario.id, datos.name, datos.birth_date)
     return ChildResponse(child=ChildOut.model_validate(hijo))
+
+@app.put("/children/{child_id}", response_model=ChildResponse)
+async def editar_hijo(
+    child_id: int,
+    datos: ChildUpdate,
+    usuario: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    hijo = await crud.get_child_owned_by_user(db, child_id, usuario.id)
+    if hijo is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ese child_id no existe o no pertenece a tu usuario",
+        )
+    hijo = await crud.update_child_name(db, hijo, datos.name)
+    return ChildResponse(child=ChildOut.model_validate(hijo))
+
+@app.delete("/children/{child_id}", response_model=DeleteResponse)
+async def borrar_hijo(
+    child_id: int,
+    usuario: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Borra un hijo completo: sus documentos en Drive, sus turnos en Calendar,
+    y sus metadatos en la base (el ON DELETE CASCADE de la tabla se encarga
+    de documents/appointments una vez que se borra la fila de children).
+
+    Igual que en borrar_documento, el borrado en Google es "best-effort" en
+    el sentido de que un 404 (ya no existe) se ignora, pero cualquier otro
+    error de Drive/Calendar corta acá y NO se borra nada de la base -- así
+    evitamos que la app "muestre" que el hijo se borró cuando en realidad
+    quedaron archivos o turnos huérfanos en la cuenta de Google del usuario.
+    """
+    hijo = await crud.get_child_owned_by_user(db, child_id, usuario.id)
+    if hijo is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ese child_id no existe o no pertenece a tu usuario",
+        )
+
+    documentos = await crud.get_documents_by_child(db, child_id)
+    for documento in documentos:
+        if documento.drive_file_id:
+            await run_in_threadpool(delete_file_from_drive, usuario, documento.drive_file_id)
+
+    turnos = await crud.get_appointments_by_child(db, child_id)
+    for turno in turnos:
+        if turno.calendar_event_id:
+            await run_in_threadpool(borrar_evento, usuario, turno.calendar_event_id)
+
+    await crud.delete_child(db, hijo)
+    return DeleteResponse(message="Deleted")
 
 # ---------- /upload ----------
 # Tipos de archivo que aceptamos. La Guía Técnica habla de "foto o PDF"

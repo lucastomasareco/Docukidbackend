@@ -9,9 +9,10 @@ Contrato exacto (Guía Técnica, sección 4):
   POST /appointments {child_id, title, date, time, notes?} -> {ok, calendar_event_id}
   GET  /appointments/{child_id} -> {appointments: [...]}
 
-Nota: la Guía Técnica NO define un DELETE /appointments, así que a propósito
-no se implementa acá (evitamos inventar endpoints fuera de lo pedido). Si
-más adelante hace falta, este archivo es donde iría un borrar_evento().
+Nota: la Guía Técnica NO define un DELETE /appointments como endpoint propio,
+pero sí hace falta borrar eventos de Calendar cuando se elimina un hijo
+completo (ver /children/{child_id} en main.py) -- para eso está
+borrar_evento() acá abajo, agregada a pedido explícito del usuario.
 
 --- Refactor hecho ---
 La construcción de credenciales OAuth vivía duplicada en drive_upload.py,
@@ -23,12 +24,16 @@ importan; si hay que tocar la lógica de renovación, se toca en un solo lugar.
 from datetime import date as date_type
 from datetime import datetime, time as time_type, timedelta
 from typing import Optional
+import logging
 
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 from .config import settings
 from .google_client import build_google_credentials
 from .models import User
+
+logger = logging.getLogger(__name__)
 
 # --- Variable NUEVA (no está en la Guía Técnica) ---
 # Zona horaria para calcular los eventos. La Guía no la especifica; uso
@@ -90,3 +95,32 @@ def crear_evento(
         .execute()
     )
     return evento_creado["id"]
+
+
+def borrar_evento(user: User, calendar_event_id: str) -> None:
+    """
+    Borra el evento del Google Calendar del usuario (calendario "primary").
+    Si el evento ya no existe (ej. el usuario lo borró a mano desde su
+    teléfono), Calendar devuelve 404 o 410 (Gone): en ese caso lo ignoramos,
+    igual que hace delete_file_from_drive con Drive. Otros errores se loguean
+    y se propagan para no dar por borrado algo que en realidad falló.
+    """
+    credenciales = build_google_credentials(user, "Google Calendar")
+    servicio = build("calendar", "v3", credentials=credenciales)
+
+    try:
+        servicio.events().delete(calendarId="primary", eventId=calendar_event_id).execute()
+    except HttpError as error:
+        status = getattr(error.resp, "status", None)
+        if status in (404, 410):
+            logger.info(
+                "Evento %s ya no existe en Calendar o no tenemos acceso; nada que borrar.",
+                calendar_event_id,
+            )
+            return
+
+        logger.warning("Error al borrar evento %s en Calendar (HTTP %s): %s", calendar_event_id, status, error)
+        raise
+    except Exception as e:
+        logger.exception("Error inesperado al borrar evento %s en Calendar: %s", calendar_event_id, e)
+        raise
