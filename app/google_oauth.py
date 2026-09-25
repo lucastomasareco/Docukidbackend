@@ -155,6 +155,19 @@ async def get_google_auth_url(usuario: User = Depends(get_current_user)):
     return {"url": auth_url}
 
 
+@router.get("/status")
+async def get_google_status(usuario: User = Depends(get_current_user)):
+    """
+    Requiere el token de Supabase (usuario logueado). Le dice al frontend si
+    esta cuenta YA conectó Google (existe google_refresh_token guardado) o
+    no. Nunca devuelve el token en sí, solo un booleano — el frontend lo usa
+    para decidir si mostrar el botón "Conectar con Google" en la pantalla de
+    inicio (Docs) o si ya no hace falta mostrarlo ahí (en Ajustes se deja
+    siempre, por si el usuario necesita reconectar).
+    """
+    return {"conectado": bool(usuario.google_refresh_token)}
+
+
 @router.get("/callback")
 async def google_callback(request: Request, db: AsyncSession = Depends(get_db)):
     """
