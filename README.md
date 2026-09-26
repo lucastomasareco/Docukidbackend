@@ -124,7 +124,7 @@ cd [carpeta-backend]
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env      # completar con las credenciales reales
+cp .env.example .env      # to do: completar con las credenciales reales
 uvicorn app.main:app --reload
 ```
 
@@ -133,7 +133,7 @@ uvicorn app.main:app --reload
 ```bash
 cd [carpeta-frontend]
 npm install
-cp .env.example .env      # completar con las credenciales reales
+cp .env.example .env      # to do: completar con las credenciales reales
 npx expo start
 ```
 
@@ -210,14 +210,14 @@ docukids/
 
 ## Tablero y seguimiento
 
-- Tablero (Trello): `[link real al tablero]`
-- Reportes de avance por sprint: `[link a la carpeta o documento de reportes]`
+- Tablero (Trello): `https://trello.com/b/VW5edIKS`
+- Reportes de avance por sprint: `https://drive.google.com/drive/folders/18-OBVJ0SlOMLR772_1hAoEmq8IT1WCLJ?usp=sharing`
 - Metodología: Scrum simplificado, backlog priorizado por dependencia técnica.
 
 ## Licencia
 
-`[definir licencia del proyecto, ej. MIT, o "Proyecto académico — uso no comercial"]`
+`[definir licencia del proyecto | Not implemented]`
 
 ---
 
-Proyecto desarrollado en el marco de `[nombre de la cátedra / materia / institución]`.
+Proyecto desarrollado en el marco de `Práctica Profesional Supervisada | Universidad Nacional Guillermo Brown`.
