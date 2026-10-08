@@ -88,16 +88,20 @@ async def delete_child(db: AsyncSession, child: Child) -> None:
 
 # ---------- Documentos ----------
 
-def compute_status(expiry_date: Optional[date]) -> str:
+def compute_status(expiry_date: Optional[date], no_expiry: bool = False) -> str:
     """
     Calcula el status de un documento AL VUELO (no se guarda en la base).
     Reglas exactas de la Guía Técnica, sección 3:
       - vencido: expiry_date < hoy
       - proximo: expiry_date entre hoy y hoy + 30 días
       - vigente: expiry_date > hoy + 30 días
+    Si el usuario confirmó que el documento NO vence (no_expiry=True),
+    devolvemos "sin_vencimiento" sin mirar la fecha.
     Si todavía no hay fecha de vencimiento (por ejemplo, porque el OCR de la
     Fase 2 aún no corrió), devolvemos "sin_fecha" en vez de inventar un estado.
     """
+    if no_expiry:
+        return "sin_vencimiento"
     if expiry_date is None:
         return "sin_fecha"
 
@@ -162,6 +166,31 @@ async def get_document_owned_by_user(
     return result.scalar_one_or_none()
 
 
+async def update_document_expiry(
+    db: AsyncSession,
+    document: Document,
+    expiry_date: Optional[date],
+    no_expiry: bool,
+) -> Document:
+    """
+    Confirma o corrige el vencimiento de un documento (PATCH /documents/{doc_id}).
+    - Con fecha: guarda la fecha y no_expiry pasa a False.
+    - Con no_expiry=True: expiry_date pasa a NULL.
+    En ambos casos last_notified_at vuelve a NULL, para que una fecha
+    corregida pueda volver a disparar el aviso por correo.
+    """
+    if no_expiry:
+        document.expiry_date = None
+        document.no_expiry = True
+    else:
+        document.expiry_date = expiry_date
+        document.no_expiry = False
+    document.last_notified_at = None
+    await db.commit()
+    await db.refresh(document)
+    return document
+
+
 async def delete_document(db: AsyncSession, document: Document) -> None:
     await db.delete(document)
     await db.commit()
@@ -219,6 +248,7 @@ async def get_documentos_pendientes_de_aviso(db: AsyncSession, umbral_dias: int)
         .join(User, Child.user_id == User.id)
         .where(
             Document.expiry_date.isnot(None),
+            Document.no_expiry.is_(False),
             Document.last_notified_at.is_(None),
             Document.expiry_date <= limite,
         )
