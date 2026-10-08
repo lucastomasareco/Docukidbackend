@@ -17,6 +17,8 @@ POST   /upload                 -> "sube" un documento (todavía simulado)
 GET    /documents/{child_id}   -> lista documentos de un hijo, con status calculado
 DELETE /documents/{doc_id}     -> borra un documento
 POST   /appointments           -> crea un turno médico (evento real en Google Calendar)
+PATCH  /appointments/{id}      -> edita un turno (y su evento en Google Calendar)
+DELETE /appointments/{id}      -> borra un turno (y su evento en Google Calendar)
 GET    /appointments/{child_id} -> lista los turnos de un hijo
 POST   /scheduler/check         -> lo llama cron-job.org 1 vez al día; manda los avisos pendientes
 /upload ahora hace, en este orden: valida el hijo y el tipo de archivo,
@@ -34,7 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 from . import crud
 from .auth import get_current_user
-from .calendar_sync import crear_evento, borrar_evento
+from .calendar_sync import actualizar_evento, crear_evento, borrar_evento
 from .database import get_db
 from .drive_upload import delete_file_from_drive, upload_file_to_drive
 from .google_oauth import router as google_oauth_router
@@ -45,6 +47,7 @@ from .schemas import (
     AppointmentCreate,
     AppointmentCreatedResponse,
     AppointmentOut,
+    AppointmentUpdate,
     AppointmentsResponse,
     ChildCreate,
     ChildOut,
@@ -400,3 +403,76 @@ async def listar_turnos(
     
     turnos = await crud.get_appointments_by_child(db, child_id)
     return AppointmentsResponse(appointments=[AppointmentOut.model_validate(t) for t in turnos])
+
+
+@app.patch("/appointments/{appointment_id}", response_model=AppointmentOut)
+async def actualizar_turno(
+    appointment_id: int,
+    datos: AppointmentUpdate,
+    usuario: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Edita un turno (ver Guía §4: PATCH /appointments/{appointment_id}).
+    Se mandan solo los campos que cambian. Se actualiza primero el evento en
+    Google Calendar y recién después la base; si Google falla, no se guarda nada.
+    """
+    turno = await crud.get_appointment_owned_by_user(db, appointment_id, usuario.id)
+    if turno is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ese appointment_id no existe o no pertenece a tu usuario",
+        )
+
+    cambios = datos.model_dump(exclude_unset=True)
+    titulo = cambios["title"].strip() if "title" in cambios else turno.title
+    fecha = cambios["date"] if "date" in cambios else turno.date
+    hora = cambios["time"] if "time" in cambios else turno.time
+    notas = cambios["notes"] if "notes" in cambios else turno.notes
+    if notas is not None:
+        notas = notas.strip() or None
+
+    calendar_event_id = await run_in_threadpool(
+        actualizar_evento,
+        user=usuario,
+        calendar_event_id=turno.calendar_event_id,
+        title=titulo,
+        fecha=fecha,
+        hora=hora,
+        notes=notas,
+    )
+    turno = await crud.update_appointment(
+        db,
+        turno,
+        title=titulo,
+        date_=fecha,
+        time_=hora,
+        notes=notas,
+        calendar_event_id=calendar_event_id,
+    )
+    return AppointmentOut.model_validate(turno)
+
+
+@app.delete("/appointments/{appointment_id}", response_model=DeleteResponse)
+async def borrar_turno(
+    appointment_id: int,
+    usuario: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Borra un turno (ver Guía §4: DELETE /appointments/{appointment_id}).
+    Primero el evento de Google Calendar (si ya no existe, se ignora) y después
+    la fila. Si Google falla por otro motivo, NO se borra nada de la base.
+    """
+    turno = await crud.get_appointment_owned_by_user(db, appointment_id, usuario.id)
+    if turno is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ese appointment_id no existe o no pertenece a tu usuario",
+        )
+
+    if turno.calendar_event_id:
+        await run_in_threadpool(borrar_evento, usuario, turno.calendar_event_id)
+
+    await crud.delete_appointment(db, turno)
+    return DeleteResponse(message="Deleted")

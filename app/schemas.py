@@ -10,6 +10,7 @@ que escribir ese chequeo a mano.
 """
 
 from datetime import date
+from datetime import date as date_type  # alias para no pisar el campo "date" dentro de las clases
 from datetime import time as dt_time
 from typing import Optional, List
 from uuid import UUID
@@ -112,6 +113,33 @@ class AppointmentCreate(BaseModel):
 class AppointmentCreatedResponse(BaseModel):
     ok: bool
     calendar_event_id: str
+
+
+class AppointmentUpdate(BaseModel):
+    """
+    Cuerpo de PATCH /appointments/{appointment_id} (editar un turno).
+    Se manda SOLO lo que cambia; lo que no se manda, queda como estaba.
+      - title: no puede ser vacío ni null.
+      - date: no puede ser null.
+      - time: "HH:MM" para fijar hora; null para quitarla (el evento pasa a ser de todo el día).
+      - notes: texto, o null / "" para borrarlas.
+    Un cuerpo vacío ({}) se rechaza con 422.
+    """
+    title: Optional[str] = None
+    date: Optional[date_type] = None
+    time: Optional[dt_time] = None
+    notes: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _validar_cambios(self):
+        enviados = self.model_fields_set
+        if not enviados:
+            raise ValueError("Mandá al menos un campo para cambiar (title, date, time o notes).")
+        if "title" in enviados and (self.title is None or not self.title.strip()):
+            raise ValueError("El título no puede estar vacío.")
+        if "date" in enviados and self.date is None:
+            raise ValueError("La fecha no puede ser null.")
+        return self
 
 
 class AppointmentOut(BaseModel):

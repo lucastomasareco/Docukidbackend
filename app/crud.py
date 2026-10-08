@@ -221,6 +221,46 @@ async def create_appointment(
     return appointment
 
 
+async def get_appointment_owned_by_user(
+    db: AsyncSession, appointment_id: int, user_id: UUID
+) -> Optional[Appointment]:
+    """
+    Igual que get_document_owned_by_user: hace un JOIN contra "children" para
+    confirmar que el turno pertenece a un hijo de ESTE usuario.
+    """
+    result = await db.execute(
+        select(Appointment)
+        .join(Child, Appointment.child_id == Child.id)
+        .where(Appointment.id == appointment_id, Child.user_id == user_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def update_appointment(
+    db: AsyncSession,
+    appointment: Appointment,
+    title: str,
+    date_: date,
+    time_: Optional[time],
+    notes: Optional[str],
+    calendar_event_id: str,
+) -> Appointment:
+    """Guarda los valores FINALES del turno (PATCH /appointments/{id})."""
+    appointment.title = title
+    appointment.date = date_
+    appointment.time = time_
+    appointment.notes = notes
+    appointment.calendar_event_id = calendar_event_id
+    await db.commit()
+    await db.refresh(appointment)
+    return appointment
+
+
+async def delete_appointment(db: AsyncSession, appointment: Appointment) -> None:
+    await db.delete(appointment)
+    await db.commit()
+
+
 async def get_appointments_by_child(db: AsyncSession, child_id: int) -> Sequence[Appointment]:
     result = await db.execute(select(Appointment).where(Appointment.child_id == child_id))
     return result.scalars().all()

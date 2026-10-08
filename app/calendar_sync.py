@@ -97,6 +97,53 @@ def crear_evento(
     return evento_creado["id"]
 
 
+def actualizar_evento(
+    user: User,
+    calendar_event_id: Optional[str],
+    title: str,
+    fecha: date_type,
+    hora: Optional[time_type],
+    notes: Optional[str],
+) -> str:
+    """
+    Actualiza el evento en Google Calendar con los valores FINALES del turno y
+    devuelve el calendar_event_id (el mismo, o uno nuevo).
+
+    Si el evento ya no existe en Google (404/410: por ejemplo se borró a mano
+    desde el teléfono), o el turno no tenía evento guardado, se crea uno nuevo
+    en vez de dar error. Otros errores se loguean y se propagan, para no dar por
+    guardado un cambio que Google no recibió.
+
+    Usa events().update (reemplaza el evento entero), que es lo que permite pasar
+    de "con hora" a "todo el día" y viceversa. Contra: si la persona agregó a mano
+    en Google datos que la app no maneja (ubicación, invitados), se pierden al
+    editar el turno desde la app.
+    """
+    credenciales = build_google_credentials(user, "Google Calendar")
+    servicio = build("calendar", "v3", credentials=credenciales)
+    cuerpo_evento = _armar_cuerpo_evento(title, fecha, hora, notes)
+
+    if calendar_event_id:
+        try:
+            evento = (
+                servicio.events()
+                .update(calendarId="primary", eventId=calendar_event_id, body=cuerpo_evento)
+                .execute()
+            )
+            if evento.get("status") != "cancelled":
+                return evento["id"]
+            logger.info("El evento %s estaba cancelado en Calendar; se crea uno nuevo.", calendar_event_id)
+        except HttpError as error:
+            status = getattr(error.resp, "status", None)
+            if status not in (404, 410):
+                logger.warning("Error al actualizar evento %s en Calendar (HTTP %s): %s", calendar_event_id, status, error)
+                raise
+            logger.info("El evento %s ya no existe en Calendar; se crea uno nuevo.", calendar_event_id)
+
+    evento_nuevo = servicio.events().insert(calendarId="primary", body=cuerpo_evento).execute()
+    return evento_nuevo["id"]
+
+
 def borrar_evento(user: User, calendar_event_id: str) -> None:
     """
     Borra el evento del Google Calendar del usuario (calendario "primary").
