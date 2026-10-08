@@ -16,7 +16,7 @@ mismo cambio acá a mano.
 
 import uuid
 
-from sqlalchemy import Column, Integer, Text, Date, Time, TIMESTAMP, ForeignKey, func
+from sqlalchemy import Boolean, Column, Integer, Text, Date, Time, TIMESTAMP, ForeignKey, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
@@ -89,6 +89,14 @@ class Document(Base):
     #   ALTER TABLE documents ADD COLUMN last_notified_at DATE;
     #
     last_notified_at = Column(Date, nullable=True)
+
+    # True cuando el usuario confirma que el documento NO vence (cartilla,
+    # radiografías). Distingue "no vence" de "el OCR no encontró fecha"
+    # (ambos tienen expiry_date NULL). Ver Guía: PATCH /documents/{doc_id}.
+    #
+    # ⚠️ Antes de usarla hay que correr en el Editor SQL de Supabase:
+    #   supabase/migrations/add_documents_no_expiry.sql
+    no_expiry = Column(Boolean, nullable=False, server_default=text("false"))
 
     # NOTA: adrede NO hay columna "status". Se calcula al vuelo en crud.py
     # comparando expiry_date con la fecha de hoy (ver sección 3 de la Guía Técnica).
