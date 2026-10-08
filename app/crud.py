@@ -198,6 +198,34 @@ async def update_document_expiry(
     return document
 
 
+async def update_document(
+    db: AsyncSession,
+    document: Document,
+    name: Optional[str],
+    expiry_date: Optional[date],
+    no_expiry: bool,
+) -> Document:
+    """
+    PATCH /documents/{doc_id}: cambia el nombre y/o el vencimiento.
+    - Solo el nombre: no toca la fecha ni last_notified_at.
+    - Si cambia el vencimiento (fecha nueva o "no vence"), last_notified_at
+      vuelve a NULL para que pueda volver a avisar.
+    """
+    if name is not None:
+        document.name = name
+    if no_expiry:
+        document.expiry_date = None
+        document.no_expiry = True
+        document.last_notified_at = None
+    elif expiry_date is not None:
+        document.expiry_date = expiry_date
+        document.no_expiry = False
+        document.last_notified_at = None
+    await db.commit()
+    await db.refresh(document)
+    return document
+
+
 async def delete_document(db: AsyncSession, document: Document) -> None:
     await db.delete(document)
     await db.commit()

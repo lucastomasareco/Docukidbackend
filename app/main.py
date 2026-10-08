@@ -336,13 +336,13 @@ async def listar_documentos(
     return DocumentsResponse(documents=salida)
 
 @app.patch("/documents/{doc_id}", response_model=DocumentOut)
-async def actualizar_vencimiento(
+async def actualizar_documento(
     doc_id: int,
     datos: DocumentUpdate,
     usuario: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Confirma o corrige el vencimiento tras el OCR (ver Guía: PATCH /documents/{doc_id})."""
+    """Cambia el nombre y/o confirma o corrige el vencimiento (ver Guía: PATCH /documents/{doc_id})."""
     documento = await crud.get_document_owned_by_user(db, doc_id, usuario.id)
     if documento is None:
         raise HTTPException(
@@ -350,9 +350,10 @@ async def actualizar_vencimiento(
             detail="Ese doc_id no existe o no pertenece a tu usuario",
         )
 
-    documento = await crud.update_document_expiry(
+    documento = await crud.update_document(
         db,
         documento,
+        name=datos.name,
         expiry_date=datos.expiry_date,
         no_expiry=bool(datos.no_expiry),
     )

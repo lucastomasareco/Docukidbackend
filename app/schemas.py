@@ -86,27 +86,32 @@ class DocumentOut(BaseModel):
 
 class DocumentUpdate(BaseModel):
     """
-    Cuerpo de PATCH /documents/{doc_id} (confirmar o corregir el vencimiento).
-    Exactamente una de estas dos formas:
-      { "expiry_date": "2027-03-15" }  -> fija la fecha (no_expiry pasa a false)
-      { "no_expiry": true }            -> el documento no vence (expiry_date pasa a NULL)
-    Cualquier otra combinación (vacío, ambos con valor, no_expiry=false solo)
-    es ambigua y se rechaza con 422.
+    Cuerpo de PATCH /documents/{doc_id}. Se manda SOLO lo que cambia, con al
+    menos una de estas cosas:
+      { "name": "DNI de Lola" }         -> cambia el nombre (no puede ser vacío)
+      { "expiry_date": "2027-03-15" }   -> fija la fecha (no_expiry pasa a false)
+      { "no_expiry": true }             -> el documento no vence (expiry_date pasa a NULL)
+    El nombre se puede combinar con una de las dos formas de vencimiento.
+    Se rechazan con 422: cuerpo vacío, expiry_date y no_expiry=true juntos,
+    no_expiry=false, y un nombre vacío o null.
     """
+    name: Optional[str] = None
     expiry_date: Optional[date] = None
     no_expiry: Optional[bool] = None
 
     @model_validator(mode="after")
-    def _una_sola_forma(self):
-        if self.no_expiry is True:
-            if self.expiry_date is not None:
-                raise ValueError(
-                    "Mandá expiry_date o no_expiry=true, no las dos a la vez."
-                )
-        elif self.expiry_date is None:
-            raise ValueError(
-                "Mandá una expiry_date o no_expiry=true."
-            )
+    def _validar(self):
+        if "name" in self.model_fields_set:
+            nombre = (self.name or "").strip()
+            if not nombre:
+                raise ValueError("El nombre no puede estar vacío.")
+            self.name = nombre
+        if self.no_expiry is False:
+            raise ValueError("no_expiry solo puede ser true; para fijar una fecha mandá expiry_date.")
+        if self.no_expiry is True and self.expiry_date is not None:
+            raise ValueError("Mandá expiry_date o no_expiry=true, no las dos a la vez.")
+        if self.name is None and self.expiry_date is None and self.no_expiry is None:
+            raise ValueError("Mandá al menos un campo: name, expiry_date o no_expiry=true.")
         return self
 
 
