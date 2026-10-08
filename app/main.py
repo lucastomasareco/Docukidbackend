@@ -19,6 +19,7 @@ DELETE /documents/{doc_id}     -> borra un documento
 POST   /appointments           -> crea un turno médico (evento real en Google Calendar)
 PATCH  /appointments/{id}      -> edita un turno (y su evento en Google Calendar)
 DELETE /appointments/{id}      -> borra un turno (y su evento en Google Calendar)
+DELETE /account                -> elimina la cuenta: datos de la app + usuario de Supabase Auth (Drive y Calendar NO se tocan)
 GET    /appointments/{child_id} -> lista los turnos de un hijo
 POST   /scheduler/check         -> lo llama cron-job.org 1 vez al día; manda los avisos pendientes
 /upload ahora hace, en este orden: valida el hijo y el tipo de archivo,
@@ -36,7 +37,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 from . import crud
+from .account import borrar_usuario_de_auth, revocar_permiso_de_google
 from .auth import get_current_user
+from .config import settings
 from .calendar_sync import actualizar_evento, crear_evento, borrar_evento
 from .database import get_db
 from .drive_upload import delete_file_from_drive, upload_file_to_drive
@@ -506,4 +509,37 @@ async def borrar_turno(
         await run_in_threadpool(borrar_evento, usuario, turno.calendar_event_id)
 
     await crud.delete_appointment(db, turno)
+    return DeleteResponse(message="Deleted")
+
+# ---------- /account ----------
+@app.delete("/account", response_model=DeleteResponse)
+async def eliminar_cuenta(
+    usuario: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Elimina la cuenta de quien llama.
+      - Se borran sus hijos, documentos y turnos de la base, y su usuario de Supabase Auth.
+      - NO se borran los archivos de Google Drive ni los eventos de Google
+        Calendar: quedan en la cuenta de Google de la persona.
+      - Se revoca el permiso de Google (mejor esfuerzo). Sin usuario, el
+        scheduler ya no le manda correos.
+    Orden: primero la base, después Supabase Auth. Si Auth falla (502), la
+    persona puede reintentar: no queda ningún dato suyo en la base.
+    """
+    if not settings.supabase_secret_key:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Falta SUPABASE_SECRET_KEY en el servidor; no se eliminó nada.",
+        )
+
+    user_id = usuario.id
+    refresh_token = usuario.google_refresh_token
+
+    await crud.delete_user(db, usuario)
+
+    if refresh_token:
+        await revocar_permiso_de_google(refresh_token)
+
+    await borrar_usuario_de_auth(user_id)
     return DeleteResponse(message="Deleted")

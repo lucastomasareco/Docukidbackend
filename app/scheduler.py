@@ -90,8 +90,8 @@ async def _procesar_envio(documento, hijo, usuario, semaphore: asyncio.Semaphore
                 )
             return documento
         except Exception:
-            # No marcamos last_notified_at: este documento se vuelve a
-            # intentar mañana. Tampoco frenamos el resto del lote por un
+            # Devolvemos None: la reserva se deshace en revisar_vencimientos
+            # y este documento se vuelve a intentar en la próxima corrida. Tampoco frenamos el resto del lote por un
             # usuario puntual que, por ejemplo, revocó el permiso de Google.
             return None
 
@@ -111,26 +111,39 @@ async def revisar_vencimientos(
     if not filas:
         return {"processed": 0}
 
+    # PASO 1 -- RESERVAR. Antes de mandar nada, "reservamos" cada documento
+    # (last_notified_at = hoy) con una instrucción atómica que solo funciona
+    # si todavía estaba sin notificar. Si cron-job.org reintenta mientras
+    # esta corrida sigue trabajando (cold start de Render), la segunda
+    # corrida no logra reservar esos documentos y no manda correos repetidos.
+    # Es secuencial a propósito: una AsyncSession no es segura en paralelo.
+    reservados = []
+    for documento, hijo, usuario in filas:
+        if await crud.reclamar_documento_para_aviso(db, documento.id):
+            reservados.append((documento, hijo, usuario))
+
+    if not reservados:
+        return {"processed": 0}
+
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_EMAILS)
 
-    # Lanzamos TODOS los envíos de correo en paralelo. El semáforo limita
+    # PASO 2 -- ENVIAR. Los envíos corren en paralelo: el semáforo limita
     # el threadpool (máx. 5 a la vez) y EMAIL_RATE_LIMITER espacia las
-    # llamadas reales a la API de Gmail a 1 por segundo. Si mañana hay 500
-    # documentos, esto no revienta ni el threadpool ni el rate limit de Google.
+    # llamadas reales a la API de Gmail a 1 por segundo.
     tasks = [
         _procesar_envio(documento, hijo, usuario, semaphore)
-        for documento, hijo, usuario in filas
+        for documento, hijo, usuario in reservados
     ]
     resultados = await asyncio.gather(*tasks)
 
-    # Actualizamos la base de datos de forma SECUENCIAL. Importante: una
-    # AsyncSession de SQLAlchemy NO es segura para uso concurrente, así que
-    # los UPDATEs se hacen uno por uno, después de que terminaron todas las
-    # tareas de red.
+    # PASO 3 -- LIBERAR LOS FALLIDOS. Si un envío falló, se deshace la
+    # reserva para que se reintente en la próxima corrida. También
+    # secuencial, por la misma razón.
     procesados = 0
-    for documento in resultados:
-        if documento is not None:
-            await crud.marcar_documento_notificado(db, documento)
+    for (documento, _hijo, _usuario), enviado in zip(reservados, resultados):
+        if enviado is not None:
             procesados += 1
+        else:
+            await crud.liberar_documento_de_aviso(db, documento.id)
 
     return {"processed": procesados}

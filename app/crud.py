@@ -13,7 +13,7 @@ from typing import Optional, Sequence
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import settings
@@ -308,4 +308,49 @@ async def marcar_documento_notificado(
 ) -> None:
     # FIX: si no viene fecha explícita, usamos el "hoy" de la zona horaria correcta
     document.last_notified_at = fecha or hoy()
+    await db.commit()
+
+
+async def reclamar_documento_para_aviso(db: AsyncSession, document_id: int) -> bool:
+    """
+    "Reserva" un documento para mandarle el aviso: pone last_notified_at = hoy
+    SOLO SI todavía estaba en NULL, en una única instrucción atómica de la base.
+    Devuelve True si lo reservó esta llamada; False si otra corrida del
+    scheduler se le adelantó (en cuyo caso NO hay que mandar el correo).
+    Es lo que evita correos duplicados cuando cron-job.org reintenta mientras
+    la primera llamada todavía está trabajando (típico tras un cold start).
+    """
+    resultado = await db.execute(
+        update(Document)
+        .where(Document.id == document_id, Document.last_notified_at.is_(None))
+        .values(last_notified_at=hoy())
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
+    return resultado.rowcount == 1
+
+
+async def liberar_documento_de_aviso(db: AsyncSession, document_id: int) -> None:
+    """
+    Deshace la reserva de reclamar_documento_para_aviso cuando el envío del
+    correo FALLÓ, para que el scheduler lo reintente en la próxima corrida.
+    """
+    await db.execute(
+        update(Document)
+        .where(Document.id == document_id)
+        .values(last_notified_at=None)
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
+
+
+# ---------- Cuenta ----------
+
+async def delete_user(db: AsyncSession, user: User) -> None:
+    """
+    Borra al usuario y, en cascada, sus hijos, documentos y turnos (solo en la
+    base de datos). NO toca Google (Drive, Calendar) ni Supabase Auth: eso
+    lo coordina eliminar_cuenta en main.py.
+    """
+    await db.delete(user)
     await db.commit()
