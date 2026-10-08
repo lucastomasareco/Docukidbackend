@@ -66,9 +66,16 @@ async def get_child_owned_by_user(db: AsyncSession, child_id: int, user_id: UUID
     return result.scalar_one_or_none()
 
 
-async def update_child_name(db: AsyncSession, child: Child, name: str) -> Child:
-    """Renombra un hijo ya validado como propio del usuario (ver get_child_owned_by_user)."""
-    child.name = name
+async def update_child(db: AsyncSession, child: Child, cambios: dict) -> Child:
+    """
+    Edita un hijo ya validado como propio del usuario (ver get_child_owned_by_user).
+    `cambios` trae SOLO los campos que la persona mandó (name y/o birth_date);
+    birth_date puede venir como None para borrarla.
+    """
+    if "name" in cambios:
+        child.name = cambios["name"].strip()
+    if "birth_date" in cambios:
+        child.birth_date = cambios["birth_date"]
     await db.commit()
     await db.refresh(child)
     return child

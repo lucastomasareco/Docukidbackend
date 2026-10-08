@@ -6,12 +6,12 @@ CRUD básico, SIN integraciones externas todavía (nada de Google Drive,
 Gemini, Google Calendar ni correos: eso es la Fase 2).
 Endpoints que vas a encontrar acá (ver contrato completo en Guía Técnica,
 sección 4):
-GET    /                       -> chequeo simple de que el server está vivo
+GET    /                       -> chequeo simple de que el server está vivo (devuelve la versión)
 GET    /auth/google/url        -> genera la URL de autorización de Google (Fase 2, paso 1)
 GET    /auth/google/callback   -> recibe la respuesta de Google y guarda el refresh_token (Fase 2, paso 1)
 GET    /children               -> lista los hijos del usuario logueado
 POST   /children               -> crea un hijo nuevo
-PUT    /children/{child_id}    -> renombra un hijo
+PUT    /children/{child_id}    -> edita un hijo (name y/o birth_date)
 DELETE /children/{child_id}    -> borra un hijo entero (documentos en Drive, turnos en Calendar y metadatos)
 POST   /upload                 -> "sube" un documento (todavía simulado)
 GET    /documents/{child_id}   -> lista documentos de un hijo, con status calculado
@@ -28,6 +28,7 @@ Con este archivo se completa la Fase 2 completa de la Guía Técnica.
 Lo que sigue (Fase 3) es configurar cron-job.org, desplegar en Render, y
 probar todo de punta a punta -- ya no es código nuevo del backend.
 """
+import logging
 import re
 from typing import Optional
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
@@ -61,7 +62,9 @@ from .schemas import (
     UploadResponse,
 )
 
-app = FastAPI(title="Docukids API", version="0.1.0 (Fase 1 - backend base)")
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Docukids API", version="1.6.0")
 
 # La app móvil no corre en un navegador con las mismas reglas que una web,
 # pero dejamos CORS abierto para no tener sorpresas si en algún momento se
@@ -80,7 +83,7 @@ app.include_router(scheduler_router)
 @app.get("/")
 async def raiz():
     """Endpoint simple para confirmar que el servidor está corriendo."""
-    return {"mensaje": "Docukids API - Fase 1 (backend base) funcionando"}
+    return {"mensaje": "Docukids API funcionando", "version": app.version}
 
 # ---------- /children ----------
 @app.get("/children", response_model=ChildrenResponse)
@@ -113,7 +116,7 @@ async def editar_hijo(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Ese child_id no existe o no pertenece a tu usuario",
         )
-    hijo = await crud.update_child_name(db, hijo, datos.name)
+    hijo = await crud.update_child(db, hijo, datos.model_dump(exclude_unset=True))
     return ChildResponse(child=ChildOut.model_validate(hijo))
 
 @app.delete("/children/{child_id}", response_model=DeleteResponse)
@@ -195,6 +198,19 @@ def _safe_filename(s: str) -> str:
     s = re.sub(r"[^\w\s\-.]", "_", s, flags=re.UNICODE)
     return s.strip()[:200] or "documento"
 
+async def _limpiar_archivo_de_drive(usuario: User, drive_file_id: str) -> None:
+    """
+    Borra de Drive un archivo recién subido cuyo registro no se pudo guardar.
+    Nunca lanza excepción: si el borrado también falla, solo lo registra
+    (con el ID del archivo, que no es un dato personal) para poder
+    limpiarlo a mano.
+    """
+    try:
+        await run_in_threadpool(delete_file_from_drive, usuario, drive_file_id)
+    except Exception:
+        logger.error("Archivo huérfano en Drive (no se pudo borrar): %s", drive_file_id)
+
+
 @app.post("/upload", response_model=UploadResponse)
 async def subir_documento(
     file: UploadFile = File(...),
@@ -255,16 +271,31 @@ async def subir_documento(
         leer_fecha_de_vencimiento, contenido, mime_type
     )
     
-    documento = await crud.create_document(
-        db,
-        child_id=child_id,
-        name=name,
-        type_=type,
-        drive_file_id=drive_file_id,
-        drive_link=drive_link,
-        expiry_date=fecha_vencimiento,
-    )
-    
+    # Si guardar en la base falla, el archivo ya está en Drive pero ningún
+    # documento lo apunta (queda "huérfano"). Lo borramos de Drive para no
+    # dejar basura en la cuenta de la persona y devolvemos un error claro.
+    try:
+        documento = await crud.create_document(
+            db,
+            child_id=child_id,
+            name=name,
+            type_=type,
+            drive_file_id=drive_file_id,
+            drive_link=drive_link,
+            expiry_date=fecha_vencimiento,
+        )
+    except Exception:
+        logger.exception("Falló el INSERT del documento; se intenta limpiar el archivo de Drive.")
+        try:
+            await db.rollback()
+        except Exception:
+            logger.warning("No se pudo hacer rollback tras el fallo del INSERT.")
+        await _limpiar_archivo_de_drive(usuario, drive_file_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="No se pudo guardar el documento. No se guardó nada; probá de nuevo.",
+        )
+
     return UploadResponse(
         status=crud.compute_status(documento.expiry_date, documento.no_expiry),
         expiry_date=documento.expiry_date,
