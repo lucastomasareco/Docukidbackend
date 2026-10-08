@@ -37,6 +37,7 @@ os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 from datetime import datetime, timedelta, timezone
 import json
 from html import escape
+import logging
 from urllib.parse import urlencode
 from uuid import UUID
 
@@ -53,6 +54,8 @@ from .auth import get_current_user
 from .config import settings
 from .database import get_db
 from .models import User
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth/google", tags=["google-oauth"])
 
@@ -304,7 +307,7 @@ async def google_callback(request: Request, db: AsyncSession = Depends(get_db)):
         # Logueamos el error real: sin esto, cualquier fallo del intercambio
         # (scope cambiado, code ya consumido, credenciales mal, etc.) queda
         # tapado por el RedirectResponse y en los logs solo se ve el 307.
-        print(f"ERROR en fetch_token: {error}")
+        logger.warning("ERROR en fetch_token (%s)", type(error).__name__)
         return _pagina_resultado(False, return_url, "intercambio_de_codigo_fallo")
 
     refresh_token = flow.credentials.refresh_token
@@ -333,7 +336,7 @@ async def google_callback(request: Request, db: AsyncSession = Depends(get_db)):
         # el dato imprescindible) y el notifier lo arregla luego con
         # getProfile() como fallback. Logueamos el error para no quedar
         # a ciegas si algún día deja de funcionar userinfo().
-        print(f"ERROR en userinfo: {error}")
+        logger.warning("ERROR en userinfo (%s)", type(error).__name__)
         google_email = None
 
     # Guardamos ambos campos en una sola UPDATE. Solo pisamos google_email

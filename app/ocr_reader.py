@@ -27,12 +27,15 @@ gratuito de Gemini, Google puede usar el contenido enviado para mejorar sus
 modelos. Estamos mandando documentos de menores (DNI, carnets de vacunación).
 Esto queda documentado como limitación aceptada por alcance académico.
 """
+import logging
 import re
 from datetime import date
 from typing import Optional
 from google import genai
 from google.genai import types
 from .config import settings
+
+logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY = settings.gemini_api_key
 
@@ -194,15 +197,13 @@ def leer_fecha_de_vencimiento(file_bytes: bytes, mime_type: str) -> Optional[dat
     try:
         texto = _transcribir_documento(file_bytes, mime_type)
     except Exception as error:
-        # 🔧 DEBUG TEMPORAL: imprimimos el error real de Gemini para ver
-        # por qué estaba devolviendo None en silencio. Sacar estos prints
-        # cuando el problema esté resuelto.
-        print(f"ERROR EN GEMINI: {error}")
+        # Solo logueamos el TIPO de error, nunca el contenido: el mensaje
+        # puede arrastrar texto del documento (datos personales de menores).
+        logger.warning("Falló la lectura con Gemini (%s); el documento queda sin fecha.", type(error).__name__)
         return None
 
-    # 🔧 DEBUG TEMPORAL: imprimimos el texto crudo que devolvió Gemini,
-    # así podemos ver si el regex no matchea por un tema de formato.
-    print(f"TEXTO TRANSCRITO POR GEMINI: {texto}")
+    # IMPORTANTE: NO loguear `texto`. Es la transcripción completa del
+    # documento (nombre, DNI, fecha de nacimiento de un menor).
 
     if not texto or texto.strip().upper() == "SIN_TEXTO_LEGIBLE":
         return None
