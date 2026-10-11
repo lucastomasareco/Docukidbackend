@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     # --- Variables OPTIONAL (con defaults preservados tal cual estaban) ---
     frontend_url: str = "docukids://"
     env: str = "production"
+    # Clave secreta de Supabase (solo backend). La usa DELETE /account para
+    # borrar al usuario de Supabase Auth. Por defecto vacía: si falta, esa
+    # ruta responde un error claro en vez de impedir que el servidor arranque.
+    supabase_secret_key: str = ""
     gemini_model: str = "gemini-2.0-flash-lite"
     notification_threshold_days: int = 15
     app_timezone: str = "America/Argentina/Buenos_Aires"

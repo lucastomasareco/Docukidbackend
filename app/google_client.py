@@ -10,9 +10,12 @@ que cambiar algo de cómo se renuevan las credenciales (por ejemplo, agregar
 reintentos ante fallos transitorios de Google), se cambia en un solo lugar.
 """
 
+import functools
+
 from fastapi import HTTPException
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.credentials import Credentials
+from googleapiclient.errors import HttpError
 
 from .config import settings
 from .models import User
@@ -61,3 +64,38 @@ def build_google_credentials(user: User, error_context: str) -> Credentials:
             ),
         )
     return credenciales
+
+
+def _es_falta_de_permisos(error: HttpError) -> bool:
+    """True si Google rechazó la llamada porque la cuenta no concedió el permiso necesario."""
+    if getattr(error.resp, "status", None) != 403:
+        return False
+    texto = str(error).lower()
+    return "insufficientpermissions" in texto or "insufficient authentication scopes" in texto
+
+
+def traducir_permisos_de_google(error_context: str):
+    """
+    Decorador para las funciones que llaman a Drive/Calendar. Si Google contesta
+    403 por permisos insuficientes (la persona no tildó todas las casillas al
+    conectar), responde 401 con el mismo texto que ya usa build_google_credentials
+    ("No se pudo renovar el acceso a ..."). La app lo traduce a "Google
+    desconectado -> Ir a Ajustes". Cualquier otro error pasa tal cual.
+    """
+    def decorador(funcion):
+        @functools.wraps(funcion)
+        def envoltura(*args, **kwargs):
+            try:
+                return funcion(*args, **kwargs)
+            except HttpError as error:
+                if _es_falta_de_permisos(error):
+                    raise HTTPException(
+                        status_code=401,
+                        detail=(
+                            f"No se pudo renovar el acceso a {error_context}: faltan permisos. "
+                            "Al conectar Google hay que tildar todas las casillas; repetí /auth/google/url."
+                        ),
+                    )
+                raise
+        return envoltura
+    return decorador

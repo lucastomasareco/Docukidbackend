@@ -20,7 +20,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload
 
-from .google_client import build_google_credentials
+from .google_client import build_google_credentials, traducir_permisos_de_google
 from .models import User
 
 logger = logging.getLogger(__name__)
@@ -50,6 +50,7 @@ def _get_or_create_carpeta(drive_service) -> str:
     return carpeta["id"]
 
 
+@traducir_permisos_de_google("Google Drive")
 def upload_file_to_drive(user: User, file_bytes: bytes, filename: str, mime_type: str) -> Tuple[str, str]:
     """
     Sube el archivo al Drive del usuario. Devuelve (drive_file_id, drive_link).
@@ -69,6 +70,7 @@ def upload_file_to_drive(user: User, file_bytes: bytes, filename: str, mime_type
     return archivo["id"], archivo.get("webViewLink", "")
 
 
+@traducir_permisos_de_google("Google Drive")
 def delete_file_from_drive(user: User, drive_file_id: str) -> None:
     """
     Borra el archivo del Drive del usuario. 

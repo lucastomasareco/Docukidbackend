@@ -30,7 +30,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from .config import settings
-from .google_client import build_google_credentials
+from .google_client import build_google_credentials, traducir_permisos_de_google
 from .models import User
 
 logger = logging.getLogger(__name__)
@@ -73,6 +73,7 @@ def _armar_cuerpo_evento(title: str, fecha: date_type, hora: Optional[time_type]
     }
 
 
+@traducir_permisos_de_google("Google Calendar")
 def crear_evento(
     user: User,
     title: str,
@@ -97,6 +98,7 @@ def crear_evento(
     return evento_creado["id"]
 
 
+@traducir_permisos_de_google("Google Calendar")
 def actualizar_evento(
     user: User,
     calendar_event_id: Optional[str],
@@ -144,6 +146,7 @@ def actualizar_evento(
     return evento_nuevo["id"]
 
 
+@traducir_permisos_de_google("Google Calendar")
 def borrar_evento(user: User, calendar_event_id: str) -> None:
     """
     Borra el evento del Google Calendar del usuario (calendario "primary").
