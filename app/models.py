@@ -98,10 +98,38 @@ class Document(Base):
     #   supabase/migrations/add_documents_no_expiry.sql
     no_expiry = Column(Boolean, nullable=False, server_default=text("false"))
 
+    # Carpeta (Salud, Escuela, ...) donde vive el documento. NULL = suelto
+    # ("A la vista"), en la raíz "Docukids" de Drive. Si se borra la carpeta
+    # de la base, el documento queda suelto (ON DELETE SET NULL), no se borra.
+    #
+    # ⚠️ Antes de usarla hay que correr en el Editor SQL de Supabase:
+    #   supabase/migrations/add_folders.sql
+    folder_id = Column(Integer, ForeignKey("folders.id", ondelete="SET NULL"), nullable=True)
+
     # NOTA: adrede NO hay columna "status". Se calcula al vuelo en crud.py
     # comparando expiry_date con la fecha de hoy (ver sección 3 de la Guía Técnica).
 
     child = relationship("Child", back_populates="documents")
+
+
+class Folder(Base):
+    """
+    Carpeta de documentos (Documentos, Salud, Escuela y las que cree la persona).
+    Son por USUARIO (las mismas para todos sus hijos) y existen también como
+    subcarpetas de "Docukids" en el Drive de la persona (estructura A de la Guía).
+    La tabla la crea supabase/migrations/add_folders.sql.
+    """
+    __tablename__ = "folders"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    name = Column(Text, nullable=False)
+    # True en Documentos, Salud y Escuela: se pueden renombrar pero no borrar.
+    is_base = Column(Boolean, nullable=False, server_default=text("false"))
+    # ID de la carpeta en Drive. NULL = todavía no se creó en Drive (se crea
+    # al primer uso, o de nuevo si la persona la borró a mano).
+    drive_folder_id = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now())
 
 
 class Appointment(Base):

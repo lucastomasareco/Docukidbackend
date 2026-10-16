@@ -15,7 +15,12 @@ PUT    /children/{child_id}    -> edita un hijo (name y/o birth_date)
 DELETE /children/{child_id}    -> borra un hijo entero (documentos en Drive, turnos en Calendar y metadatos)
 POST   /upload                 -> "sube" un documento (todavía simulado)
 GET    /documents/{child_id}   -> lista documentos de un hijo, con status calculado
+PATCH  /documents/{doc_id}     -> renombra, confirma la fecha y/o cambia de carpeta un documento
 DELETE /documents/{doc_id}     -> borra un documento
+GET    /folders                -> lista las carpetas (crea las 3 de base la primera vez)
+POST   /folders                -> crea una carpeta (también en Drive)
+PATCH  /folders/{id}           -> renombra una carpeta (también en Drive)
+DELETE /folders/{id}           -> borra una carpeta (sus archivos pasan a la raíz "Docukids")
 POST   /appointments           -> crea un turno médico (evento real en Google Calendar)
 PATCH  /appointments/{id}      -> edita un turno (y su evento en Google Calendar)
 DELETE /appointments/{id}      -> borra un turno (y su evento en Google Calendar)
@@ -34,6 +39,7 @@ import re
 from typing import Optional
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 from . import crud
@@ -42,7 +48,15 @@ from .auth import get_current_user
 from .config import settings
 from .calendar_sync import actualizar_evento, crear_evento, borrar_evento
 from .database import get_db
-from .drive_upload import delete_file_from_drive, upload_file_to_drive
+from .drive_upload import (
+    borrar_carpeta_de_drive,
+    crear_carpeta_en_drive,
+    delete_file_from_drive,
+    mover_archivo_a_carpeta,
+    renombrar_carpeta_en_drive,
+    upload_file_to_drive,
+    upload_file_to_drive_folder,
+)
 from .google_oauth import router as google_oauth_router
 from .models import User
 from .ocr_reader import leer_fecha_de_vencimiento
@@ -62,12 +76,17 @@ from .schemas import (
     DocumentOut,
     DocumentsResponse,
     DocumentUpdate,
+    FolderCreate,
+    FolderOut,
+    FolderResponse,
+    FoldersResponse,
+    FolderUpdate,
     UploadResponse,
 )
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Docukids API", version="1.6.0")
+app = FastAPI(title="Docukids API", version="2.3.0")
 
 # La app móvil no corre en un navegador con las mismas reglas que una web,
 # pero dejamos CORS abierto para no tener sorpresas si en algún momento se
@@ -220,6 +239,7 @@ async def subir_documento(
     child_id: int = Form(...),
     name: str = Form(...),
     type: Optional[str] = Form(None),
+    folder_id: Optional[int] = Form(None),
     usuario: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -231,6 +251,11 @@ async def subir_documento(
             detail="Ese child_id no existe o no pertenece a tu usuario",
         )
     
+    # Si viene folder_id, tiene que ser una carpeta de esta persona (ajena = 404).
+    carpeta = None
+    if folder_id is not None:
+        carpeta = await _carpeta_propia_o_404(db, folder_id, usuario.id)
+
     # Leemos el archivo en chunks para evitar agotar la memoria RAM (protección contra DoS)
     contenido = await _leer_con_limite(file, _MAX_BYTES)
     if len(contenido) == 0:
@@ -259,13 +284,31 @@ async def subir_documento(
     # levanta un HTTPException 400 clara pidiendo pasar primero por
     # GET /auth/google/url (ver drive_upload.py).
     nombre_archivo = f"{_safe_filename(hijo.name)} - {_safe_filename(name)}"
-    drive_file_id, drive_link = await run_in_threadpool(
-        upload_file_to_drive,
-        user=usuario,
-        file_bytes=contenido,
-        filename=nombre_archivo,
-        mime_type=mime_type,
-    )
+    if carpeta is None:
+        drive_file_id, drive_link = await run_in_threadpool(
+            upload_file_to_drive,
+            user=usuario,
+            file_bytes=contenido,
+            filename=nombre_archivo,
+            mime_type=mime_type,
+        )
+    else:
+        # Sube a la subcarpeta (la crea en Drive si todavía no existe o la borraron a mano).
+        drive_file_id, drive_link, drive_folder_vigente = await run_in_threadpool(
+            upload_file_to_drive_folder,
+            user=usuario,
+            file_bytes=contenido,
+            filename=nombre_archivo,
+            mime_type=mime_type,
+            folder_name=carpeta.name,
+            drive_folder_id=carpeta.drive_folder_id,
+        )
+        try:
+            await crud.set_folder_drive_id(db, carpeta, drive_folder_vigente)
+        except Exception:
+            # No es grave: la próxima vez se vuelve a buscar o crear la carpeta.
+            logger.warning("No se pudo guardar el id de Drive de la carpeta %s.", carpeta.id)
+            await db.rollback()
     
     # --- Fase 2, paso 3: OCR con Gemini para detectar la fecha de vencimiento ---
     # Nunca lanza excepción (ver ocr_reader.py): si falla, expiry_date queda
@@ -286,6 +329,7 @@ async def subir_documento(
             drive_file_id=drive_file_id,
             drive_link=drive_link,
             expiry_date=fecha_vencimiento,
+            folder_id=folder_id,
         )
     except Exception:
         logger.exception("Falló el INSERT del documento; se intenta limpiar el archivo de Drive.")
@@ -305,6 +349,7 @@ async def subir_documento(
         no_expiry=documento.no_expiry,
         drive_link=documento.drive_link,
         doc_id=documento.id,
+        folder_id=documento.folder_id,
     )
 
 # ---------- /documents ----------
@@ -330,6 +375,7 @@ async def listar_documentos(
             no_expiry=documento.no_expiry,
             status=crud.compute_status(documento.expiry_date, documento.no_expiry),
             drive_link=documento.drive_link,
+            folder_id=documento.folder_id,
         )
         for documento in documentos
     ]
@@ -350,12 +396,31 @@ async def actualizar_documento(
             detail="Ese doc_id no existe o no pertenece a tu usuario",
         )
 
+    # Cambio de carpeta: primero Drive y después la base (si Drive falla, no se guarda nada).
+    cambiar_carpeta = "folder_id" in datos.model_fields_set
+    if cambiar_carpeta and datos.folder_id != documento.folder_id:
+        carpeta = None
+        if datos.folder_id is not None:
+            carpeta = await _carpeta_propia_o_404(db, datos.folder_id, usuario.id)
+        if documento.drive_file_id:
+            drive_folder_vigente = await run_in_threadpool(
+                mover_archivo_a_carpeta,
+                usuario,
+                documento.drive_file_id,
+                carpeta.name if carpeta else None,
+                carpeta.drive_folder_id if carpeta else None,
+            )
+            if carpeta is not None:
+                await crud.set_folder_drive_id(db, carpeta, drive_folder_vigente)
+
     documento = await crud.update_document(
         db,
         documento,
         name=datos.name,
         expiry_date=datos.expiry_date,
         no_expiry=bool(datos.no_expiry),
+        cambiar_carpeta=cambiar_carpeta,
+        folder_id=datos.folder_id,
     )
     return DocumentOut(
         id=documento.id,
@@ -364,6 +429,7 @@ async def actualizar_documento(
         no_expiry=documento.no_expiry,
         status=crud.compute_status(documento.expiry_date, documento.no_expiry),
         drive_link=documento.drive_link,
+        folder_id=documento.folder_id,
     )
 
 
@@ -385,6 +451,116 @@ async def borrar_documento(
     if documento.drive_file_id:
         await run_in_threadpool(delete_file_from_drive, usuario, documento.drive_file_id)
     await crud.delete_document(db, documento)
+    return DeleteResponse(message="Deleted")
+
+# ---------- /folders ----------
+async def _carpeta_propia_o_404(db: AsyncSession, folder_id: int, user_id):
+    carpeta = await crud.get_folder_owned_by_user(db, folder_id, user_id)
+    if carpeta is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ese folder_id no existe o no pertenece a tu usuario",
+        )
+    return carpeta
+
+
+def _nombre_repetido() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Ya tenés una carpeta con ese nombre.",
+    )
+
+
+@app.get("/folders", response_model=FoldersResponse)
+async def listar_carpetas(
+    usuario: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Lista las carpetas. La primera vez crea Documentos, Salud y Escuela (solo en la base)."""
+    carpetas = await crud.get_folders_ensuring_base(db, usuario.id)
+    return FoldersResponse(folders=[FolderOut.model_validate(c) for c in carpetas])
+
+
+@app.post("/folders", response_model=FolderResponse)
+async def crear_carpeta(
+    datos: FolderCreate,
+    usuario: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Crea una carpeta en la base y, si la persona ya conectó Google, también en
+    Drive (subcarpeta de "Docukids"). Sin Google conectado se crea igual en la
+    base y en Drive se crea al primer uso.
+    """
+    if await crud.folder_name_exists(db, usuario.id, datos.name):
+        raise _nombre_repetido()
+
+    drive_folder_id = None
+    if usuario.google_refresh_token:
+        drive_folder_id = await run_in_threadpool(crear_carpeta_en_drive, usuario, datos.name)
+
+    try:
+        carpeta = await crud.create_folder(db, usuario.id, datos.name, drive_folder_id)
+    except IntegrityError:
+        await db.rollback()
+        if drive_folder_id:
+            try:
+                await run_in_threadpool(borrar_carpeta_de_drive, usuario, drive_folder_id, [])
+            except Exception:
+                logger.warning("No se pudo limpiar la carpeta de Drive %s tras un nombre repetido.", drive_folder_id)
+        raise _nombre_repetido()
+    return FolderResponse(folder=FolderOut.model_validate(carpeta))
+
+
+@app.patch("/folders/{folder_id}", response_model=FolderResponse)
+async def renombrar_carpeta(
+    folder_id: int,
+    datos: FolderUpdate,
+    usuario: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Renombra la carpeta (también las de base). Primero Drive y después la base."""
+    carpeta = await _carpeta_propia_o_404(db, folder_id, usuario.id)
+    if datos.name == carpeta.name:
+        return FolderResponse(folder=FolderOut.model_validate(carpeta))
+    if await crud.folder_name_exists(db, usuario.id, datos.name, exclude_id=carpeta.id):
+        raise _nombre_repetido()
+
+    if carpeta.drive_folder_id:
+        await run_in_threadpool(renombrar_carpeta_en_drive, usuario, carpeta.drive_folder_id, datos.name)
+    try:
+        carpeta = await crud.rename_folder(db, carpeta, datos.name)
+    except IntegrityError:
+        await db.rollback()
+        raise _nombre_repetido()
+    return FolderResponse(folder=FolderOut.model_validate(carpeta))
+
+
+@app.delete("/folders/{folder_id}", response_model=DeleteResponse)
+async def borrar_carpeta(
+    folder_id: int,
+    usuario: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Borra una carpeta que no sea de base. NUNCA borra documentos: primero los
+    archivos pasan a la raíz "Docukids" en Drive, después se borra la carpeta
+    de Drive y por último la fila (los documentos quedan con folder_id = NULL).
+    Si Drive falla por algo distinto de un 404, no se borra nada de la base.
+    """
+    carpeta = await _carpeta_propia_o_404(db, folder_id, usuario.id)
+    if carpeta.is_base:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Las carpetas Documentos, Salud y Escuela no se pueden borrar (sí renombrar).",
+        )
+
+    if carpeta.drive_folder_id:
+        documentos = await crud.get_documents_in_folder(db, carpeta.id)
+        archivos = [d.drive_file_id for d in documentos if d.drive_file_id]
+        await run_in_threadpool(borrar_carpeta_de_drive, usuario, carpeta.drive_folder_id, archivos)
+
+    await crud.delete_folder(db, carpeta)
     return DeleteResponse(message="Deleted")
 
 # ---------- /appointments ----------

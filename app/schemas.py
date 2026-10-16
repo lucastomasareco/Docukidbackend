@@ -71,6 +71,7 @@ class UploadResponse(BaseModel):
     no_expiry: bool = False
     drive_link: Optional[str] = None
     doc_id: int
+    folder_id: Optional[int] = None
 
 
 class DocumentOut(BaseModel):
@@ -82,6 +83,7 @@ class DocumentOut(BaseModel):
     no_expiry: bool = False
     status: str
     drive_link: Optional[str] = None
+    folder_id: Optional[int] = None
 
 
 class DocumentUpdate(BaseModel):
@@ -98,6 +100,8 @@ class DocumentUpdate(BaseModel):
     name: Optional[str] = None
     expiry_date: Optional[date] = None
     no_expiry: Optional[bool] = None
+    # Carpeta destino: un número para mover; null para dejarlo suelto (raíz "Docukids").
+    folder_id: Optional[int] = None
 
     @model_validator(mode="after")
     def _validar(self):
@@ -110,9 +114,63 @@ class DocumentUpdate(BaseModel):
             raise ValueError("no_expiry solo puede ser true; para fijar una fecha mandá expiry_date.")
         if self.no_expiry is True and self.expiry_date is not None:
             raise ValueError("Mandá expiry_date o no_expiry=true, no las dos a la vez.")
-        if self.name is None and self.expiry_date is None and self.no_expiry is None:
-            raise ValueError("Mandá al menos un campo: name, expiry_date o no_expiry=true.")
+        if (
+            self.name is None
+            and self.expiry_date is None
+            and self.no_expiry is None
+            and "folder_id" not in self.model_fields_set
+        ):
+            raise ValueError("Mandá al menos un campo: name, expiry_date, no_expiry=true o folder_id.")
         return self
+
+
+# ---------- Carpetas (folders) ----------
+
+_MAX_NOMBRE_CARPETA = 30
+
+
+def _limpiar_nombre_carpeta(valor: Optional[str]) -> str:
+    nombre = (valor or "").strip()
+    if not nombre:
+        raise ValueError("El nombre de la carpeta no puede estar vacío.")
+    if len(nombre) > _MAX_NOMBRE_CARPETA:
+        raise ValueError(f"El nombre de la carpeta puede tener hasta {_MAX_NOMBRE_CARPETA} letras.")
+    return nombre
+
+
+class FolderCreate(BaseModel):
+    name: str
+
+    @model_validator(mode="after")
+    def _validar(self):
+        self.name = _limpiar_nombre_carpeta(self.name)
+        return self
+
+
+class FolderUpdate(BaseModel):
+    """Cuerpo de PATCH /folders/{id}: solo se puede cambiar el nombre (obligatorio)."""
+    name: str
+
+    @model_validator(mode="after")
+    def _validar(self):
+        self.name = _limpiar_nombre_carpeta(self.name)
+        return self
+
+
+class FolderOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    is_base: bool = False
+
+
+class FolderResponse(BaseModel):
+    folder: FolderOut
+
+
+class FoldersResponse(BaseModel):
+    folders: List[FolderOut]
 
 
 class DocumentsResponse(BaseModel):

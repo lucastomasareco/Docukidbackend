@@ -13,11 +13,12 @@ from typing import Optional, Sequence
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import settings
-from .models import Child, Document, Appointment, User
+from .models import Child, Document, Folder, Appointment, User
 
 
 # ---------- Configuración de zona horaria ----------
@@ -131,6 +132,7 @@ async def create_document(
     drive_file_id: Optional[str] = None,
     drive_link: Optional[str] = None,
     expiry_date: Optional[date] = None,
+    folder_id: Optional[int] = None,
 ) -> Document:
     """
     Guarda los metadatos del documento. drive_file_id/drive_link vienen de
@@ -145,6 +147,7 @@ async def create_document(
         expiry_date=expiry_date,
         drive_file_id=drive_file_id,
         drive_link=drive_link,
+        folder_id=folder_id,
     )
     db.add(document)
     await db.commit()
@@ -204,15 +207,21 @@ async def update_document(
     name: Optional[str],
     expiry_date: Optional[date],
     no_expiry: bool,
+    cambiar_carpeta: bool = False,
+    folder_id: Optional[int] = None,
 ) -> Document:
     """
-    PATCH /documents/{doc_id}: cambia el nombre y/o el vencimiento.
+    PATCH /documents/{doc_id}: cambia el nombre, el vencimiento y/o la carpeta.
+    - cambiar_carpeta=True: el documento pasa a folder_id (None = suelto). No
+      toca last_notified_at.
     - Solo el nombre: no toca la fecha ni last_notified_at.
     - Si cambia el vencimiento (fecha nueva o "no vence"), last_notified_at
       vuelve a NULL para que pueda volver a avisar.
     """
     if name is not None:
         document.name = name
+    if cambiar_carpeta:
+        document.folder_id = folder_id
     if no_expiry:
         document.expiry_date = None
         document.no_expiry = True
@@ -228,6 +237,101 @@ async def update_document(
 
 async def delete_document(db: AsyncSession, document: Document) -> None:
     await db.delete(document)
+    await db.commit()
+
+
+# ---------- Carpetas (folders) ----------
+
+# Carpetas que toda persona tiene desde el principio (se pueden renombrar, no borrar).
+CARPETAS_BASE = ("Documentos", "Salud", "Escuela")
+
+
+async def get_folders_by_user(db: AsyncSession, user_id: UUID) -> Sequence[Folder]:
+    """Las de base primero; después las demás por fecha de creación."""
+    result = await db.execute(
+        select(Folder)
+        .where(Folder.user_id == user_id)
+        .order_by(Folder.is_base.desc(), Folder.created_at, Folder.id)
+    )
+    return result.scalars().all()
+
+
+async def get_folders_ensuring_base(db: AsyncSession, user_id: UUID) -> Sequence[Folder]:
+    """
+    GET /folders: si la persona no tiene ninguna carpeta, crea las 3 de base
+    SOLO en la base de datos (Drive se toca recién al primer uso).
+    Si dos pedidos llegan a la vez, el índice único evita duplicados: el que
+    pierde la carrera hace rollback y vuelve a leer.
+    """
+    carpetas = await get_folders_by_user(db, user_id)
+    if carpetas:
+        return carpetas
+    for nombre in CARPETAS_BASE:
+        db.add(Folder(user_id=user_id, name=nombre, is_base=True))
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+    return await get_folders_by_user(db, user_id)
+
+
+async def get_folder_owned_by_user(db: AsyncSession, folder_id: int, user_id: UUID) -> Optional[Folder]:
+    result = await db.execute(
+        select(Folder).where(Folder.id == folder_id, Folder.user_id == user_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def folder_name_exists(
+    db: AsyncSession, user_id: UUID, name: str, exclude_id: Optional[int] = None
+) -> bool:
+    """True si la persona ya tiene una carpeta con ese nombre (sin mirar mayúsculas)."""
+    consulta = select(Folder.id).where(
+        Folder.user_id == user_id, func.lower(Folder.name) == name.lower()
+    )
+    if exclude_id is not None:
+        consulta = consulta.where(Folder.id != exclude_id)
+    result = await db.execute(consulta.limit(1))
+    return result.scalar_one_or_none() is not None
+
+
+async def create_folder(
+    db: AsyncSession, user_id: UUID, name: str, drive_folder_id: Optional[str] = None
+) -> Folder:
+    carpeta = Folder(user_id=user_id, name=name, is_base=False, drive_folder_id=drive_folder_id)
+    db.add(carpeta)
+    await db.commit()  # puede lanzar IntegrityError si justo se repitió el nombre
+    await db.refresh(carpeta)
+    return carpeta
+
+
+async def rename_folder(db: AsyncSession, carpeta: Folder, name: str) -> Folder:
+    carpeta.name = name
+    await db.commit()  # puede lanzar IntegrityError si justo se repitió el nombre
+    await db.refresh(carpeta)
+    return carpeta
+
+
+async def set_folder_drive_id(db: AsyncSession, carpeta: Folder, drive_folder_id: Optional[str]) -> None:
+    """Guarda el id de Drive de la carpeta (se crea al primer uso o se recrea si la borraron)."""
+    if carpeta.drive_folder_id == drive_folder_id:
+        return
+    carpeta.drive_folder_id = drive_folder_id
+    await db.commit()
+    await db.refresh(carpeta)
+
+
+async def get_documents_in_folder(db: AsyncSession, folder_id: int) -> Sequence[Document]:
+    result = await db.execute(select(Document).where(Document.folder_id == folder_id))
+    return result.scalars().all()
+
+
+async def delete_folder(db: AsyncSession, carpeta: Folder) -> None:
+    """
+    Borra la fila. Sus documentos quedan sueltos (ON DELETE SET NULL en la base).
+    Los archivos en Drive los mueve ANTES el llamador (ver borrar_carpeta en main.py).
+    """
+    await db.delete(carpeta)
     await db.commit()
 
 
