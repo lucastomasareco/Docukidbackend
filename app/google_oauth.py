@@ -104,6 +104,28 @@ SCOPES = [
 ]
 
 
+# Permisos SIN los cuales la app no funciona. Google deja destildar casillas
+# en su pantalla de permisos: si falta alguno, no guardamos la conexión.
+PERMISOS_OBLIGATORIOS = {
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/gmail.send",
+}
+
+
+def _faltan_permisos(flow: Flow) -> bool:
+    """
+    True si Google NO concedió alguno de los permisos obligatorios.
+    OJO: flow.credentials.scopes repite lo que PEDIMOS; lo que Google
+    CONCEDIÓ está en granted_scopes (o, como respaldo, en el token de la sesión).
+    """
+    concedidos = getattr(flow.credentials, "granted_scopes", None)
+    if concedidos is None:
+        crudo = (flow.oauth2session.token or {}).get("scope") or []
+        concedidos = crudo.split() if isinstance(crudo, str) else crudo
+    return not PERMISOS_OBLIGATORIOS.issubset(set(concedidos))
+
+
 def _build_flow() -> Flow:
     if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI):
         raise HTTPException(
@@ -152,6 +174,7 @@ MENSAJES_ERROR = {
     "state_invalido": "Pasaron más de 10 minutos desde que empezaste. Volvé a la app y tocá el botón otra vez.",
     "intercambio_de_codigo_fallo": "Google no nos devolvió el permiso. Volvé a la app y probá de nuevo.",
     "sin_refresh_token": "Google no entregó el permiso permanente. Volvé a la app y probá de nuevo.",
+    "permisos_incompletos": "Faltó tildar algún permiso. Volvé a la app, tocá el botón otra vez y en la pantalla de Google marcá TODAS las casillas (o \"Seleccionar todo\").",
 }
 
 
@@ -309,6 +332,13 @@ async def google_callback(request: Request, db: AsyncSession = Depends(get_db)):
         # tapado por el RedirectResponse y en los logs solo se ve el 307.
         logger.warning("ERROR en fetch_token (%s)", type(error).__name__)
         return _pagina_resultado(False, return_url, "intercambio_de_codigo_fallo")
+
+    # Google deja destildar casillas. Si faltan Drive, Calendar o Gmail, NO
+    # guardamos nada: así la app no muestra "conectado" cuando subir un
+    # documento o agendar un turno iba a fallar.
+    if _faltan_permisos(flow):
+        logger.warning("Conexión de Google con permisos incompletos; no se guardó.")
+        return _pagina_resultado(False, return_url, "permisos_incompletos")
 
     refresh_token = flow.credentials.refresh_token
 
