@@ -133,6 +133,7 @@ async def create_document(
     drive_link: Optional[str] = None,
     expiry_date: Optional[date] = None,
     folder_id: Optional[int] = None,
+    mime_type: Optional[str] = None,
 ) -> Document:
     """
     Guarda los metadatos del documento. drive_file_id/drive_link vienen de
@@ -148,11 +149,18 @@ async def create_document(
         drive_file_id=drive_file_id,
         drive_link=drive_link,
         folder_id=folder_id,
+        mime_type=mime_type,
     )
     db.add(document)
     await db.commit()
     await db.refresh(document)
     return document
+
+
+async def set_document_mime_type(db: AsyncSession, document: Document, mime_type: str) -> None:
+    """Completa el tipo de un documento anterior a v2.4 (lo informa Drive al pedir la miniatura)."""
+    document.mime_type = mime_type
+    await db.commit()
 
 
 async def get_documents_by_child(db: AsyncSession, child_id: int) -> Sequence[Document]:

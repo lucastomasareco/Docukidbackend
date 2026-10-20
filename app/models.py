@@ -106,6 +106,15 @@ class Document(Base):
     #   supabase/migrations/add_folders.sql
     folder_id = Column(Integer, ForeignKey("folders.id", ondelete="SET NULL"), nullable=True)
 
+    # Tipo real del archivo ("image/jpeg", "application/pdf", ...). NULL = todavía
+    # no se sabe (documentos anteriores a v2.4): se completa solo la primera vez
+    # que se pide su miniatura. La app lo usa para decidir si abre el visor propio
+    # (imágenes) o Drive (PDF y desconocidos).
+    #
+    # ⚠️ Antes de usarla hay que correr en el Editor SQL de Supabase:
+    #   supabase/migrations/add_documents_mime_type.sql
+    mime_type = Column(Text, nullable=True)
+
     # NOTA: adrede NO hay columna "status". Se calcula al vuelo en crud.py
     # comparando expiry_date con la fecha de hoy (ver sección 3 de la Guía Técnica).
 

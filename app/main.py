@@ -36,9 +36,12 @@ probar todo de punta a punta -- ya no es código nuevo del backend.
 """
 import logging
 import re
-from typing import Optional
+from typing import Literal, Optional
+import requests
+from googleapiclient.errors import HttpError
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
@@ -52,7 +55,10 @@ from .drive_upload import (
     borrar_carpeta_de_drive,
     crear_carpeta_en_drive,
     delete_file_from_drive,
+    PX_MINIATURA,
+    SinMiniatura,
     mover_archivo_a_carpeta,
+    obtener_miniatura_de_drive,
     renombrar_carpeta_en_drive,
     upload_file_to_drive,
     upload_file_to_drive_folder,
@@ -330,6 +336,7 @@ async def subir_documento(
             drive_link=drive_link,
             expiry_date=fecha_vencimiento,
             folder_id=folder_id,
+            mime_type=mime_type,
         )
     except Exception:
         logger.exception("Falló el INSERT del documento; se intenta limpiar el archivo de Drive.")
@@ -350,6 +357,7 @@ async def subir_documento(
         drive_link=documento.drive_link,
         doc_id=documento.id,
         folder_id=documento.folder_id,
+        mime_type=documento.mime_type,
     )
 
 # ---------- /documents ----------
@@ -376,6 +384,7 @@ async def listar_documentos(
             status=crud.compute_status(documento.expiry_date, documento.no_expiry),
             drive_link=documento.drive_link,
             folder_id=documento.folder_id,
+            mime_type=documento.mime_type,
         )
         for documento in documentos
     ]
@@ -430,6 +439,67 @@ async def actualizar_documento(
         status=crud.compute_status(documento.expiry_date, documento.no_expiry),
         drive_link=documento.drive_link,
         folder_id=documento.folder_id,
+        mime_type=documento.mime_type,
+    )
+
+
+@app.get("/documents/{doc_id}/thumbnail")
+async def miniatura_de_documento(
+    doc_id: int,
+    size: Literal["small", "large"] = "small",
+    usuario: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Devuelve la IMAGEN (no JSON) del documento: miniatura chica para la lista
+    (size=small, 240 px) o versión grande para el visor (size=large, 1600 px).
+    La baja el backend de Drive con las credenciales de la persona; la app nunca
+    ve enlaces ni tokens de Google. Ver Guía v2.4.
+    """
+    documento = await crud.get_document_owned_by_user(db, doc_id, usuario.id)
+    if documento is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ese doc_id no existe o no pertenece a tu usuario",
+        )
+    sin_miniatura = HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Este documento no tiene miniatura (todavía).",
+    )
+    if not documento.drive_file_id:
+        raise sin_miniatura
+
+    mime_archivo: Optional[str] = None
+    try:
+        contenido, tipo, mime_archivo = await run_in_threadpool(
+            obtener_miniatura_de_drive, usuario, documento.drive_file_id, PX_MINIATURA[size]
+        )
+    except SinMiniatura as sin:
+        mime_archivo = sin.mime_type
+        error: Optional[HTTPException] = sin_miniatura
+    except (HttpError, requests.RequestException):
+        logger.warning("No se pudo obtener la miniatura del documento %s.", documento.id)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="No se pudo obtener la imagen de Drive. Probá de nuevo.",
+        )
+    else:
+        error = None
+
+    # Documentos anteriores a v2.4: aprovechamos y guardamos su tipo.
+    if documento.mime_type is None and mime_archivo:
+        try:
+            await crud.set_document_mime_type(db, documento, mime_archivo)
+        except Exception:
+            logger.warning("No se pudo guardar el tipo del documento %s.", documento.id)
+            await db.rollback()
+
+    if error is not None:
+        raise error
+    return Response(
+        content=contenido,
+        media_type=tipo,
+        headers={"Cache-Control": "private, max-age=86400"},
     )
 
 

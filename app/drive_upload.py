@@ -19,8 +19,10 @@ subcarpeta a mano en Drive, asegurar_subcarpeta la vuelve a crear.
 """
 import io
 import logging
+import re
 from typing import List, Optional, Tuple
 
+from google.auth.transport.requests import AuthorizedSession
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload
@@ -253,3 +255,73 @@ def delete_file_from_drive(user: User, drive_file_id: str) -> None:
         # Para errores no HTTP (ej. problemas de red locales, timeout, etc.)
         logger.exception("Error inesperado al borrar archivo %s en Drive: %s", drive_file_id, e)
         raise
+
+# ---------------------------------------------------------------------------
+# Miniaturas (v2.4): GET /documents/{doc_id}/thumbnail
+# ---------------------------------------------------------------------------
+# Drive genera miniaturas de fotos y de PDF (primera página). El enlace
+# ("thumbnailLink") dura pocas horas y, si el archivo no es público, hay que
+# pedirlo con las credenciales de la persona. Por eso la imagen la baja el
+# backend y la reenvía a la app: la app nunca ve enlaces ni tokens de Google.
+
+PX_MINIATURA = {"small": 240, "large": 1600}
+_TIMEOUT_MINIATURA = 10  # segundos de espera con Google
+
+
+class SinMiniatura(Exception):
+    """Drive no tiene miniatura para este archivo (todavía) o el archivo ya no está."""
+
+    def __init__(self, mime_type: Optional[str] = None):
+        super().__init__("Sin miniatura")
+        # Si Drive llegó a decirnos el tipo del archivo, lo conservamos: sirve igual.
+        self.mime_type = mime_type
+
+
+def _con_tamano(enlace: str, px: int) -> str:
+    """El enlace de Drive termina en '=s220' (tamaño en píxeles); lo cambiamos por el pedido."""
+    if re.search(r"=s\d+(-[a-z]+)*$", enlace):
+        return re.sub(r"=s\d+(-[a-z]+)*$", f"=s{px}", enlace)
+    return enlace  # formato inesperado: se usa tal cual (Drive elegirá el tamaño)
+
+
+@traducir_permisos_de_google("Google Drive")
+def obtener_miniatura_de_drive(user: User, drive_file_id: str, px: int) -> Tuple[bytes, str, Optional[str]]:
+    """
+    Devuelve (bytes_de_la_imagen, content_type, mime_type_del_archivo_original).
+
+    Lanza SinMiniatura si el archivo no existe, está en la papelera o Drive todavía
+    no tiene miniatura. Otros errores (red, 429, 5xx, respuesta rara) se propagan
+    y main.py los traduce a 502. No se registran enlaces ni tokens en los logs.
+    """
+    credenciales = build_google_credentials(user, "Google Drive")
+    drive_service = build("drive", "v3", credentials=credenciales)
+
+    try:
+        info = drive_service.files().get(
+            fileId=drive_file_id, fields="mimeType, thumbnailLink, trashed"
+        ).execute()
+    except HttpError as error:
+        if _status(error) == 404:
+            raise SinMiniatura()
+        raise
+
+    mime = info.get("mimeType")
+    enlace = info.get("thumbnailLink")
+    if info.get("trashed") or not enlace:
+        raise SinMiniatura(mime)
+
+    sesion = AuthorizedSession(credenciales)
+    try:
+        respuesta = sesion.get(_con_tamano(enlace, px), timeout=_TIMEOUT_MINIATURA)
+    finally:
+        sesion.close()
+
+    if respuesta.status_code in (403, 404):
+        # El enlace venció o Drive todavía no terminó de generarla.
+        raise SinMiniatura(mime)
+    respuesta.raise_for_status()
+
+    tipo = (respuesta.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    if not tipo.startswith("image/") or not respuesta.content:
+        raise SinMiniatura(mime)
+    return respuesta.content, tipo, mime

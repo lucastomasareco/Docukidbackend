@@ -72,6 +72,7 @@ class UploadResponse(BaseModel):
     drive_link: Optional[str] = None
     doc_id: int
     folder_id: Optional[int] = None
+    mime_type: Optional[str] = None
 
 
 class DocumentOut(BaseModel):
@@ -84,6 +85,7 @@ class DocumentOut(BaseModel):
     status: str
     drive_link: Optional[str] = None
     folder_id: Optional[int] = None
+    mime_type: Optional[str] = None  # None = todavía no se sabe (documento anterior a v2.4)
 
 
 class DocumentUpdate(BaseModel):
