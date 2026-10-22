@@ -98,9 +98,13 @@ app = FastAPI(title="Docukids API", version="2.3.0")
 # pero dejamos CORS abierto para no tener sorpresas si en algún momento se
 # prueba la API desde una herramienta web (Swagger UI incluido) o desde un
 # emulador. No expone nada que ya no esté protegido por el token JWT.
+# CORS_ORIGINS="*" (por defecto) o una lista separada por comas. La autenticación va por
+# cabecera Authorization (no cookies), así que no hace falta allow_credentials.
+_origenes_cors = [o.strip().rstrip("/") for o in settings.cors_origins.split(",") if o.strip()] or ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_origenes_cors,
     allow_methods=["*"],
     allow_headers=["*"],
 )

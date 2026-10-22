@@ -37,6 +37,12 @@ class Settings(BaseSettings):
 
     # --- Variables OPTIONAL (con defaults preservados tal cual estaban) ---
     frontend_url: str = "docukids://"
+    # URL de la versión web (ej. https://docukids.vercel.app), SIN barra final.
+    # Vacía = la web no puede usarse como destino de retorno de Google.
+    web_origin: str = ""
+    # Orígenes permitidos por CORS, separados por coma. "*" = cualquiera (por defecto).
+    # Cuando la web ya funcione: https://docukids.vercel.app,http://localhost:8081
+    cors_origins: str = "*"
     env: str = "production"
     # Clave secreta de Supabase (solo backend). La usa DELETE /account para
     # borrar al usuario de Supabase Auth. Por defecto vacía: si falta, esa

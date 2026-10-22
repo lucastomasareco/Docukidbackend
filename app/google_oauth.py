@@ -80,6 +80,8 @@ STATE_SECRET = settings.state_secret
 # "deep link" de tu app (algo como "docukids://"). Cuando tengas el scheme
 # final en app.json, actualizá también este default.
 FRONTEND_URL = settings.frontend_url
+# Versión web: solo se acepta volver a ESTE origen exacto (evita redirecciones abiertas).
+WEB_ORIGIN = settings.web_origin.rstrip("/")
 
 # --- Nota sobre ENV ---
 # Usado únicamente para decidir si registramos endpoints de desarrollo
@@ -180,8 +182,15 @@ MENSAJES_ERROR = {
 
 def _return_url_seguro(candidato: str | None) -> str:
     """Solo acepta direcciones de la app; cualquier otra cosa cae al valor por defecto."""
-    if candidato and len(candidato) <= 500 and candidato.startswith(RETURN_PREFIXES):
-        return candidato
+    if candidato and len(candidato) <= 500:
+        if candidato.startswith(RETURN_PREFIXES):
+            return candidato
+        # Web: el origen exacto, o una ruta dentro de él ("/" evita que
+        # https://docukids.vercel.app.malo.com pase el filtro).
+        if WEB_ORIGIN and (candidato == WEB_ORIGIN or candidato.startswith(WEB_ORIGIN + "/")):
+            return candidato
+    # Sin return_to válido: si hay web configurada y la app móvil no es el destino, igual
+    # cae al valor por defecto de siempre.
     return FRONTEND_URL
 
 
