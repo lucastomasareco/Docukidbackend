@@ -44,7 +44,37 @@ class User(Base):
     google_email = Column(Text, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
 
+    # Familia a la que pertenece (v2.5). NULL = sin familia. El titular también
+    # lo tiene apuntando a SU familia; el miembro, a la del titular. El miembro
+    # NUNCA tiene google_refresh_token: usa el del titular (ver auth.get_data_owner).
+    # Sin relationship() a propósito: users y families se unen por DOS claves
+    # (families.owner_id y users.family_id) y SQLAlchemy no sabría cuál usar.
+    # Las consultas de familia se arman a mano en crud.py.
+    #
+    # ⚠️ Antes de usarla hay que correr en el Editor SQL de Supabase:
+    #   supabase/migrations/add_families.sql
+    family_id = Column(Integer, ForeignKey("families.id", ondelete="SET NULL"), nullable=True)
+
     children = relationship("Child", back_populates="owner", cascade="all, delete-orphan")
+
+
+class Family(Base):
+    """
+    Familia (v2.5): dos cuentas (titular y un miembro) que ven los mismos datos.
+    Los datos (hijos, documentos, carpetas, turnos) siguen a nombre del TITULAR
+    (owner_id); el miembro los ve porque el backend resuelve al titular en cada
+    pedido. La tabla la crea supabase/migrations/add_families.sql.
+    """
+    __tablename__ = "families"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # El titular: quien conectó Google. UNIQUE en la base (una sola familia por titular).
+    owner_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True)
+    # Código de invitación de 6 caracteres. NULL = sin invitación activa.
+    # NUNCA debe salir en logs; solo lo ve el titular.
+    invite_code = Column(Text, unique=True, nullable=True)
+    invite_expires_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now())
 
 
 class Child(Base):
