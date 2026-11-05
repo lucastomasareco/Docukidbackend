@@ -549,6 +549,9 @@ async def borrar_documento(
     return DeleteResponse(message="Deleted")
 
 # ---------- /folders ----------
+# Familias (v2.5): igual que en /children y /documents, `usuario` es el DUEÑO DE
+# LOS DATOS (get_data_owner). Las carpetas son las del titular, y también sus
+# subcarpetas en Drive: las dos personas de la familia ven y editan las mismas.
 async def _carpeta_propia_o_404(db: AsyncSession, folder_id: int, user_id):
     carpeta = await crud.get_folder_owned_by_user(db, folder_id, user_id)
     if carpeta is None:
@@ -568,7 +571,7 @@ def _nombre_repetido() -> HTTPException:
 
 @app.get("/folders", response_model=FoldersResponse)
 async def listar_carpetas(
-    usuario: User = Depends(get_current_user),
+    usuario: User = Depends(get_data_owner),
     db: AsyncSession = Depends(get_db),
 ):
     """Lista las carpetas. La primera vez crea Documentos, Salud y Escuela (solo en la base)."""
@@ -579,7 +582,7 @@ async def listar_carpetas(
 @app.post("/folders", response_model=FolderResponse)
 async def crear_carpeta(
     datos: FolderCreate,
-    usuario: User = Depends(get_current_user),
+    usuario: User = Depends(get_data_owner),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -611,7 +614,7 @@ async def crear_carpeta(
 async def renombrar_carpeta(
     folder_id: int,
     datos: FolderUpdate,
-    usuario: User = Depends(get_current_user),
+    usuario: User = Depends(get_data_owner),
     db: AsyncSession = Depends(get_db),
 ):
     """Renombra la carpeta (también las de base). Primero Drive y después la base."""
@@ -634,7 +637,7 @@ async def renombrar_carpeta(
 @app.delete("/folders/{folder_id}", response_model=DeleteResponse)
 async def borrar_carpeta(
     folder_id: int,
-    usuario: User = Depends(get_current_user),
+    usuario: User = Depends(get_data_owner),
     db: AsyncSession = Depends(get_db),
 ):
     """
