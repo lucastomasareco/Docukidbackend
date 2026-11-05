@@ -9,10 +9,10 @@ algo mal formado, FastAPI responde con un error 422 claro, sin que tengamos
 que escribir ese chequeo a mano.
 """
 
-from datetime import date
+from datetime import date, datetime
 from datetime import date as date_type  # alias para no pisar el campo "date" dentro de las clases
 from datetime import time as dt_time
-from typing import Optional, List
+from typing import List, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -238,3 +238,36 @@ class AppointmentOut(BaseModel):
 
 class AppointmentsResponse(BaseModel):
     appointments: List[AppointmentOut]
+
+
+# ---------- Familia (v2.5) ----------
+# OJO: ninguna de estas clases tiene un campo para google_refresh_token.
+# Es a propósito: nada de /family puede devolverlo (Guía §12, regla 9).
+
+class FamilyMemberOut(BaseModel):
+    id: UUID
+    email: str
+    role: Literal["owner", "member"]
+
+
+class FamilyOut(BaseModel):
+    id: int
+    role: Literal["owner", "member"]  # el rol de QUIEN pregunta
+    members: List[FamilyMemberOut]
+    # Solo los ve el titular y solo mientras la invitación está vigente.
+    invite_code: Optional[str] = None
+    invite_expires_at: Optional[datetime] = None  # ISO 8601 en UTC (termina en +00:00)
+
+
+class FamilyJoin(BaseModel):
+    """Cuerpo de POST /family/join."""
+    code: str
+
+
+class FamilyResponse(BaseModel):
+    family: Optional[FamilyOut] = None  # null = la persona no tiene familia
+
+
+class InviteResponse(BaseModel):
+    invite_code: str
+    invite_expires_at: datetime  # ISO 8601 en UTC (termina en +00:00)

@@ -24,6 +24,13 @@ DELETE /folders/{id}           -> borra una carpeta (sus archivos pasan a la ra�
 POST   /appointments           -> crea un turno médico (evento real en Google Calendar)
 PATCH  /appointments/{id}      -> edita un turno (y su evento en Google Calendar)
 DELETE /appointments/{id}      -> borra un turno (y su evento en Google Calendar)
+GET    /family                 -> la familia de quien pregunta (o null)
+POST   /family                 -> crea una familia (quien llama queda como titular)
+POST   /family/invite          -> el titular genera un código de invitación (24 h, un uso)
+POST   /family/join            -> unirse a una familia con un código
+POST   /family/leave           -> el miembro sale de la familia
+DELETE /family/members/{id}    -> el titular quita al miembro
+DELETE /family                 -> el titular disuelve la familia
 DELETE /account                -> elimina la cuenta: datos de la app + usuario de Supabase Auth (Drive y Calendar NO se tocan)
 GET    /appointments/{child_id} -> lista los turnos de un hijo
 POST   /scheduler/check         -> lo llama cron-job.org 1 vez al día; manda los avisos pendientes
@@ -36,7 +43,9 @@ probar todo de punta a punta -- ya no es código nuevo del backend.
 """
 import logging
 import re
+from datetime import timezone
 from typing import Literal, Optional
+from uuid import UUID
 import requests
 from googleapiclient.errors import HttpError
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
@@ -82,11 +91,16 @@ from .schemas import (
     DocumentOut,
     DocumentsResponse,
     DocumentUpdate,
+    FamilyJoin,
+    FamilyMemberOut,
+    FamilyOut,
+    FamilyResponse,
     FolderCreate,
     FolderOut,
     FolderResponse,
     FoldersResponse,
     FolderUpdate,
+    InviteResponse,
     UploadResponse,
 )
 
@@ -760,6 +774,236 @@ async def borrar_turno(
         await run_in_threadpool(borrar_evento, usuario, turno.calendar_event_id)
 
     await crud.delete_appointment(db, turno)
+    return DeleteResponse(message="Deleted")
+
+# ---------- /family (v2.5) ----------
+# Estos endpoints usan get_current_user (la PERSONA que llama), no get_data_owner:
+# hablan de quién es quién en la familia, no de los datos de los hijos.
+
+def _como_utc(momento):
+    """La base guarda UTC sin zona; al enviarlo se marca como UTC (+00:00) para que la app no lo lea como hora local."""
+    return momento.replace(tzinfo=timezone.utc)
+
+
+async def _familia_para_responder(db: AsyncSession, user_id, familia) -> FamilyOut:
+    """Arma la familia tal como la ve `user_id`. El código solo lo ve el titular y solo si sigue vigente."""
+    miembros = await crud.get_family_members(db, familia.id)
+    # El titular siempre va primero en la lista.
+    miembros = sorted(miembros, key=lambda u: u.id != familia.owner_id)
+    es_titular = familia.owner_id == user_id
+
+    salida = FamilyOut(
+        id=familia.id,
+        role="owner" if es_titular else "member",
+        members=[
+            FamilyMemberOut(
+                id=u.id,
+                email=u.email,
+                role="owner" if u.id == familia.owner_id else "member",
+            )
+            for u in miembros
+        ],
+    )
+    if es_titular and crud.invitacion_vigente(familia):
+        salida.invite_code = familia.invite_code
+        salida.invite_expires_at = _como_utc(familia.invite_expires_at)
+    return salida
+
+
+@app.get("/family", response_model=FamilyResponse)
+async def ver_familia(
+    usuario: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """La familia de quien pregunta, o { family: null } si no tiene."""
+    if usuario.family_id is None:
+        return FamilyResponse(family=None)
+    familia = await crud.get_family(db, usuario.family_id)
+    if familia is None:
+        return FamilyResponse(family=None)
+    return FamilyResponse(family=await _familia_para_responder(db, usuario.id, familia))
+
+
+@app.post("/family", response_model=FamilyResponse)
+async def crear_familia(
+    usuario: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Crea una familia nueva; quien llama queda como titular. Solo si todavía no tiene una."""
+    ya_en_familia = HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Ya formás parte de una familia.",
+    )
+    if usuario.family_id is not None:
+        raise ya_en_familia
+    user_id = usuario.id
+    familia = await crud.create_family(db, usuario)
+    if familia is None:
+        raise ya_en_familia
+    return FamilyResponse(family=await _familia_para_responder(db, user_id, familia))
+
+
+@app.post("/family/invite", response_model=InviteResponse)
+async def invitar_a_la_familia(
+    usuario: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Solo el titular. Genera un código de 6 caracteres que vence en 24 h y sirve
+    una sola vez. Si ya había uno, este lo reemplaza (el anterior deja de servir).
+    """
+    sin_familia = HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Todavía no tenés una familia. Creala primero.",
+    )
+    if usuario.family_id is None:
+        raise sin_familia
+    familia = await crud.get_family(db, usuario.family_id)
+    if familia is None:
+        raise sin_familia
+    if familia.owner_id != usuario.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo el titular de la familia puede generar códigos de invitación.",
+        )
+
+    family_id = familia.id
+    try:
+        codigo, vence = await crud.create_invite(db, family_id)
+    except RuntimeError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo generar el código. Probá de nuevo en un momento.",
+        )
+    return InviteResponse(invite_code=codigo, invite_expires_at=_como_utc(vence))
+
+
+async def _familia_como_titular(db: AsyncSession, usuario: User):
+    """La familia de `usuario`, pero solo si es su titular. Si no: 404 (sin familia) o 403 (es miembro)."""
+    if usuario.family_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Todavía no tenés una familia.",
+        )
+    familia = await crud.get_family(db, usuario.family_id)
+    if familia is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Todavía no tenés una familia.",
+        )
+    if familia.owner_id != usuario.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo el titular de la familia puede hacer esto.",
+        )
+    return familia
+
+
+@app.post("/family/join", response_model=FamilyResponse)
+async def unirse_a_la_familia(
+    datos: FamilyJoin,
+    usuario: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Unirse a una familia con un código. Reglas (Guía §12):
+      - Código inexistente, vencido o ya usado: 404 (no se distingue).
+      - Familia con 2 personas: 409.
+      - Si la persona ya tiene hijos propios: 409 (para no perderlos sin querer).
+      - Si tenía Google conectado por su cuenta, se desconecta: desde ahora usa el del titular.
+    El código no se escribe en ningún log.
+    """
+    if usuario.family_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Ya formás parte de una familia.",
+        )
+
+    codigo_invalido = HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Ese código no existe, venció o ya se usó.",
+    )
+    codigo = datos.code.strip().upper()
+    familia = await crud.get_family_by_active_code(db, codigo)
+    if familia is None:
+        raise codigo_invalido
+
+    miembros = await crud.get_family_members(db, familia.id)
+    if len(miembros) >= crud.MAX_FAMILIA:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Esa familia ya está completa (máximo 2 personas).",
+        )
+    if await crud.user_has_own_data(db, usuario.id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Ya tenés hijos cargados en tu cuenta. Borralos antes de unirte a una familia, así no se pierden sin querer.",
+        )
+
+    user_id = usuario.id
+    family_id = familia.id
+    token_propio = usuario.google_refresh_token  # se guarda antes de que join_family lo borre
+    if not await crud.join_family(db, usuario, family_id, codigo):
+        raise codigo_invalido
+    if token_propio:
+        await revocar_permiso_de_google(token_propio)  # mejor esfuerzo, nunca falla
+
+    await db.refresh(familia)
+    return FamilyResponse(family=await _familia_para_responder(db, user_id, familia))
+
+
+@app.post("/family/leave", response_model=DeleteResponse)
+async def salir_de_la_familia(
+    usuario: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """El miembro sale de la familia y queda con una cuenta vacía. El titular no puede salir: tiene que disolverla."""
+    if usuario.family_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No formás parte de ninguna familia.",
+        )
+    familia = await crud.get_family(db, usuario.family_id)
+    if familia is not None and familia.owner_id == usuario.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="El titular no puede salir de su familia. Si querés terminarla, disolvela.",
+        )
+    await crud.remove_from_family(db, usuario)
+    return DeleteResponse(message="Left")
+
+
+@app.delete("/family/members/{user_id}", response_model=DeleteResponse)
+async def quitar_miembro(
+    user_id: UUID,
+    usuario: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Solo el titular. Saca a un miembro de la familia; ese miembro queda con una cuenta vacía."""
+    familia = await _familia_como_titular(db, usuario)
+    if user_id == usuario.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="El titular no puede quitarse a sí mismo. Si querés terminar la familia, disolvela.",
+        )
+    miembro = await crud.get_user_by_id(db, user_id)
+    if miembro is None or miembro.family_id != familia.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Esa persona no es parte de tu familia.",
+        )
+    await crud.remove_from_family(db, miembro)
+    return DeleteResponse(message="Deleted")
+
+
+@app.delete("/family", response_model=DeleteResponse)
+async def disolver_familia(
+    usuario: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Solo el titular. Disuelve la familia: el miembro queda con su cuenta vacía y los datos siguen con el titular."""
+    familia = await _familia_como_titular(db, usuario)
+    await crud.dissolve_family(db, familia.id)
     return DeleteResponse(message="Deleted")
 
 # ---------- /account ----------

@@ -8,17 +8,18 @@ mañana hay que cambiar algo de cómo se guarda un documento, se cambia en un
 solo lugar.
 """
 
-from datetime import date, datetime, time, timedelta
+import secrets
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional, Sequence
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import settings
-from .models import Child, Document, Folder, Appointment, User
+from .models import Appointment, Child, Document, Family, Folder, User
 
 
 # ---------- Configuración de zona horaria ----------
@@ -493,4 +494,174 @@ async def delete_user(db: AsyncSession, user: User) -> None:
     lo coordina eliminar_cuenta en main.py.
     """
     await db.delete(user)
+    await db.commit()
+
+
+# ---------- Familias (v2.5) ----------
+
+# Letras y números SIN los que se confunden al leerlos o dictarlos (0/O, 1/I/L).
+_ALFABETO_CODIGO = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+CODIGO_LARGO = 6
+CODIGO_HORAS_DE_VALIDEZ = 24
+MAX_FAMILIA = 2  # titular + un miembro
+
+
+def ahora_utc() -> datetime:
+    """
+    Hora actual en UTC y SIN zona horaria. Las columnas TIMESTAMP de la base
+    (families.invite_expires_at) no guardan zona, así que SIEMPRE escribimos
+    y comparamos en UTC. (No confundir con hoy(), que es una FECHA en la zona
+    de los usuarios.)
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def generar_codigo_de_invitacion() -> str:
+    """Código al azar de 6 caracteres. Usa `secrets` (seguro), no `random`."""
+    return "".join(secrets.choice(_ALFABETO_CODIGO) for _ in range(CODIGO_LARGO))
+
+
+def invitacion_vigente(familia: Family) -> bool:
+    """True si la familia tiene un código que todavía no venció."""
+    return (
+        bool(familia.invite_code)
+        and familia.invite_expires_at is not None
+        and familia.invite_expires_at > ahora_utc()
+    )
+
+
+async def get_family(db: AsyncSession, family_id: int) -> Optional[Family]:
+    return await db.get(Family, family_id)
+
+
+async def get_family_members(db: AsyncSession, family_id: int) -> Sequence[User]:
+    """Todas las personas de la familia (el titular también tiene family_id)."""
+    result = await db.execute(
+        select(User).where(User.family_id == family_id).order_by(User.created_at)
+    )
+    return result.scalars().all()
+
+
+async def create_family(db: AsyncSession, usuario: User) -> Optional[Family]:
+    """
+    Crea la familia con `usuario` como titular y lo anota en users.family_id,
+    todo en una sola operación (o se hace todo o no se hace nada).
+    Devuelve None si la base la rechazó porque esa persona YA es titular de una
+    familia (families.owner_id es UNIQUE): el llamador responde 409.
+    """
+    familia = Family(owner_id=usuario.id)
+    db.add(familia)
+    try:
+        await db.flush()  # la base le asigna el id a la familia, todavía sin confirmar
+    except IntegrityError:
+        await db.rollback()
+        return None
+    usuario.family_id = familia.id
+    await db.commit()
+    await db.refresh(familia)
+    return familia
+
+
+async def create_invite(db: AsyncSession, family_id: int) -> tuple[str, datetime]:
+    """
+    Genera un código nuevo para la familia y REEMPLAZA al anterior (si había).
+    Devuelve (codigo, vence_en_utc_sin_zona). Si el código al azar justo
+    coincide con el de otra familia (invite_code es UNIQUE), prueba con otro.
+    No escribe el código en ningún log.
+    """
+    for _ in range(5):
+        codigo = generar_codigo_de_invitacion()
+        vence = ahora_utc() + timedelta(hours=CODIGO_HORAS_DE_VALIDEZ)
+        try:
+            await db.execute(
+                update(Family)
+                .where(Family.id == family_id)
+                .values(invite_code=codigo, invite_expires_at=vence)
+                .execution_options(synchronize_session=False)
+            )
+            await db.commit()
+            return codigo, vence
+        except IntegrityError:
+            await db.rollback()
+    raise RuntimeError("No se pudo generar un código de invitación único")
+
+
+async def get_user_by_id(db: AsyncSession, user_id: UUID) -> Optional[User]:
+    return await db.get(User, user_id)
+
+
+async def get_family_by_active_code(db: AsyncSession, codigo: str) -> Optional[Family]:
+    """
+    La familia que tiene ESE código, solo si todavía no venció. Código
+    inexistente, vencido o ya usado (se borra al usarse) = None: a propósito
+    no se distingue entre ellos.
+    """
+    result = await db.execute(
+        select(Family).where(
+            Family.invite_code == codigo,
+            Family.invite_expires_at > ahora_utc(),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def user_has_own_data(db: AsyncSession, user_id: UUID) -> bool:
+    """
+    True si la persona ya tiene hijos propios. Los documentos y turnos cuelgan
+    de los hijos, así que mirar hijos alcanza. Las carpetas NO cuentan: las 3
+    de base se crean solas la primera vez que se pide /folders.
+    """
+    result = await db.execute(select(Child.id).where(Child.user_id == user_id).limit(1))
+    return result.first() is not None
+
+
+async def join_family(db: AsyncSession, usuario: User, family_id: int, codigo: str) -> bool:
+    """
+    Mete a `usuario` en la familia usando el código, en UNA operación atómica:
+      1) "gasta" el código (lo pone en NULL) solo si sigue siendo ese y no venció.
+         Si dos personas lo usan a la vez, solo a una le sale rowcount == 1.
+      2) anota family_id en la persona y le borra cualquier dato de Google propio
+         (el miembro nunca tiene google_refresh_token: usa el del titular).
+    Devuelve False (sin cambiar nada) si el código ya no servía.
+    """
+    resultado = await db.execute(
+        update(Family)
+        .where(
+            Family.id == family_id,
+            Family.invite_code == codigo,
+            Family.invite_expires_at > ahora_utc(),
+        )
+        .values(invite_code=None, invite_expires_at=None)
+        .execution_options(synchronize_session=False)
+    )
+    if resultado.rowcount != 1:
+        await db.rollback()
+        return False
+    usuario.family_id = family_id
+    usuario.google_refresh_token = None
+    usuario.google_email = None
+    await db.commit()
+    return True
+
+
+async def remove_from_family(db: AsyncSession, usuario: User) -> None:
+    """Saca a una persona de su familia (ella se va, o el titular la quita). No se copia ni se borra ningún dato."""
+    usuario.family_id = None
+    await db.commit()
+
+
+async def dissolve_family(db: AsyncSession, family_id: int) -> None:
+    """
+    Disuelve la familia: todas las personas (titular incluido) quedan sin
+    familia y se borra la fila de `families`. Los datos del titular no se tocan.
+    """
+    await db.execute(
+        update(User)
+        .where(User.family_id == family_id)
+        .values(family_id=None)
+        .execution_options(synchronize_session=False)
+    )
+    await db.execute(
+        delete(Family).where(Family.id == family_id).execution_options(synchronize_session=False)
+    )
     await db.commit()
