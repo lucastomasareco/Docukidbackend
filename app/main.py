@@ -106,7 +106,7 @@ from .schemas import (
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Docukids API", version="2.3.0")
+app = FastAPI(title="Docukids API", version="2.5.0")
 
 # La app móvil no corre en un navegador con las mismas reglas que una web,
 # pero dejamos CORS abierto para no tener sorpresas si en algún momento se
