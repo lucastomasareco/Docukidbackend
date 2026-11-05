@@ -28,7 +28,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .config import settings
 from .database import get_db
-from .models import User
+from .models import Family, User
 
 # PyJWKClient cachea las claves públicas y las refresca automáticamente
 # cuando aparece un "kid" desconocido (rotación de claves de Supabase).
@@ -99,3 +99,51 @@ async def get_current_user(
         await db.refresh(user)
 
     return user
+
+
+# ----------------------------------------------------------------------
+# Familias (v2.5): ¿de QUIÉN son los datos de este pedido?
+# ----------------------------------------------------------------------
+# Los hijos, documentos, carpetas y turnos están a nombre del TITULAR
+# (quien conectó Google). Si quien hace el pedido es el miembro de una
+# familia, los endpoints tienen que consultar con el titular, no con él.
+#
+# get_current_user NO cambia: sigue devolviendo a la persona que hizo el
+# pedido (sirve para /family, /account, etc.). Los endpoints de datos usan
+# get_data_owner en su lugar:
+#
+#     @app.get("/children")
+#     async def listar_hijos(titular: User = Depends(get_data_owner)):
+#         ...
+#
+# Qué NO hace: no comprueba permisos de titular vs. miembro (eso va en
+# cada endpoint de /family). Solo resuelve de quién son los datos.
+
+
+async def resolver_titular(db: AsyncSession, usuario: User) -> User:
+    """
+    Devuelve al titular si `usuario` es miembro de una familia; si no, al
+    propio `usuario`. Separada de la dependencia para poder probarla sola.
+
+    Ante cualquier dato raro (familia inexistente, titular borrado) devuelve
+    al propio usuario: nunca a un tercero ni un error. Así, lo peor que pasa
+    es que la persona vea sus propios datos (vacíos), no los de otra familia.
+    """
+    if usuario.family_id is None:
+        return usuario
+
+    familia = await db.get(Family, usuario.family_id)
+    if familia is None or familia.owner_id == usuario.id:
+        # Sin familia real, o es el propio titular: los datos son suyos.
+        return usuario
+
+    titular = await db.get(User, familia.owner_id)
+    return titular if titular is not None else usuario
+
+
+async def get_data_owner(
+    usuario: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """Dependencia de FastAPI: el usuario dueño de los datos de este pedido."""
+    return await resolver_titular(db, usuario)
