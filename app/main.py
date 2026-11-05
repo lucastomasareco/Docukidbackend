@@ -207,6 +207,9 @@ async def borrar_hijo(
     return DeleteResponse(message="Deleted")
 
 # ---------- /upload ----------
+# Familias (v2.5): en /upload y en /documents `usuario` es el DUEÑO DE LOS DATOS
+# (get_data_owner), igual que en /children. Los archivos se suben, se leen y se
+# borran en el Drive del titular, tanto si lo pide él como su familiar.
 # Tipos de archivo que aceptamos. La Guía Técnica habla de "foto o PDF"
 # (Docukids.md, sección 3-A), así que validamos eso explícitamente en vez de
 # aceptar cualquier cosa (evita, por ejemplo, que alguien suba un .exe).
@@ -268,7 +271,7 @@ async def subir_documento(
     name: str = Form(...),
     type: Optional[str] = Form(None),
     folder_id: Optional[int] = Form(None),
-    usuario: User = Depends(get_current_user),
+    usuario: User = Depends(get_data_owner),
     db: AsyncSession = Depends(get_db),
 ):
     # Primero confirmamos que el hijo exista Y sea del usuario que llama.
@@ -386,7 +389,7 @@ async def subir_documento(
 @app.get("/documents/{child_id}", response_model=DocumentsResponse)
 async def listar_documentos(
     child_id: int,
-    usuario: User = Depends(get_current_user),
+    usuario: User = Depends(get_data_owner),
     db: AsyncSession = Depends(get_db),
 ):
     hijo = await crud.get_child_owned_by_user(db, child_id, usuario.id)
@@ -416,7 +419,7 @@ async def listar_documentos(
 async def actualizar_documento(
     doc_id: int,
     datos: DocumentUpdate,
-    usuario: User = Depends(get_current_user),
+    usuario: User = Depends(get_data_owner),
     db: AsyncSession = Depends(get_db),
 ):
     """Cambia el nombre y/o confirma o corrige el vencimiento (ver Guía: PATCH /documents/{doc_id})."""
@@ -469,7 +472,7 @@ async def actualizar_documento(
 async def miniatura_de_documento(
     doc_id: int,
     size: Literal["small", "large"] = "small",
-    usuario: User = Depends(get_current_user),
+    usuario: User = Depends(get_data_owner),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -528,7 +531,7 @@ async def miniatura_de_documento(
 @app.delete("/documents/{doc_id}", response_model=DeleteResponse)
 async def borrar_documento(
     doc_id: int,
-    usuario: User = Depends(get_current_user),
+    usuario: User = Depends(get_data_owner),
     db: AsyncSession = Depends(get_db),
 ):
     documento = await crud.get_document_owned_by_user(db, doc_id, usuario.id)
