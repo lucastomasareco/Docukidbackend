@@ -56,7 +56,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 from . import crud
 from .account import borrar_usuario_de_auth, revocar_permiso_de_google
-from .auth import get_current_user
+from .auth import get_current_user, get_data_owner
 from .config import settings
 from .calendar_sync import actualizar_evento, crear_evento, borrar_evento
 from .database import get_db
@@ -132,9 +132,13 @@ async def raiz():
     return {"mensaje": "Docukids API funcionando", "version": app.version}
 
 # ---------- /children ----------
+# Familias (v2.5): en estos endpoints `usuario` es el DUEÑO DE LOS DATOS
+# (get_data_owner): el titular si quien llama es miembro de una familia, o la
+# propia persona si no tiene familia. Con eso los dos ven los mismos hijos, y
+# Drive y Calendar se usan con las credenciales del titular.
 @app.get("/children", response_model=ChildrenResponse)
 async def listar_hijos(
-    usuario: User = Depends(get_current_user),
+    usuario: User = Depends(get_data_owner),
     db: AsyncSession = Depends(get_db),
 ):
     hijos = await crud.get_children_by_user(db, usuario.id)
@@ -143,7 +147,7 @@ async def listar_hijos(
 @app.post("/children", response_model=ChildResponse)
 async def crear_hijo(
     datos: ChildCreate,
-    usuario: User = Depends(get_current_user),
+    usuario: User = Depends(get_data_owner),
     db: AsyncSession = Depends(get_db),
 ):
     hijo = await crud.create_child(db, usuario.id, datos.name, datos.birth_date)
@@ -153,7 +157,7 @@ async def crear_hijo(
 async def editar_hijo(
     child_id: int,
     datos: ChildUpdate,
-    usuario: User = Depends(get_current_user),
+    usuario: User = Depends(get_data_owner),
     db: AsyncSession = Depends(get_db),
 ):
     hijo = await crud.get_child_owned_by_user(db, child_id, usuario.id)
@@ -168,7 +172,7 @@ async def editar_hijo(
 @app.delete("/children/{child_id}", response_model=DeleteResponse)
 async def borrar_hijo(
     child_id: int,
-    usuario: User = Depends(get_current_user),
+    usuario: User = Depends(get_data_owner),
     db: AsyncSession = Depends(get_db),
 ):
     """
