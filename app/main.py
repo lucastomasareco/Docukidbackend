@@ -662,10 +662,13 @@ async def borrar_carpeta(
     return DeleteResponse(message="Deleted")
 
 # ---------- /appointments ----------
+# Familias (v2.5): igual que en los grupos anteriores, `usuario` es el DUEÑO DE
+# LOS DATOS (get_data_owner). Los turnos son los del titular y los eventos se
+# crean, editan y borran en el Google Calendar del titular.
 @app.post("/appointments", response_model=AppointmentCreatedResponse)
 async def crear_turno(
     datos: AppointmentCreate,
-    usuario: User = Depends(get_current_user),
+    usuario: User = Depends(get_data_owner),
     db: AsyncSession = Depends(get_db),
 ):
     hijo = await crud.get_child_owned_by_user(db, datos.child_id, usuario.id)
@@ -700,7 +703,7 @@ async def crear_turno(
 @app.get("/appointments/{child_id}", response_model=AppointmentsResponse)
 async def listar_turnos(
     child_id: int,
-    usuario: User = Depends(get_current_user),
+    usuario: User = Depends(get_data_owner),
     db: AsyncSession = Depends(get_db),
 ):
     hijo = await crud.get_child_owned_by_user(db, child_id, usuario.id)
@@ -718,7 +721,7 @@ async def listar_turnos(
 async def actualizar_turno(
     appointment_id: int,
     datos: AppointmentUpdate,
-    usuario: User = Depends(get_current_user),
+    usuario: User = Depends(get_data_owner),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -765,7 +768,7 @@ async def actualizar_turno(
 @app.delete("/appointments/{appointment_id}", response_model=DeleteResponse)
 async def borrar_turno(
     appointment_id: int,
-    usuario: User = Depends(get_current_user),
+    usuario: User = Depends(get_data_owner),
     db: AsyncSession = Depends(get_db),
 ):
     """
