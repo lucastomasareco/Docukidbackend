@@ -50,7 +50,7 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from .auth import get_current_user
+from .auth import get_current_user, get_data_owner, resolver_titular
 from .config import settings
 from .database import get_db
 from .models import User
@@ -176,6 +176,7 @@ MENSAJES_ERROR = {
     "state_invalido": "Pasaron más de 10 minutos desde que empezaste. Volvé a la app y tocá el botón otra vez.",
     "intercambio_de_codigo_fallo": "Google no nos devolvió el permiso. Volvé a la app y probá de nuevo.",
     "sin_refresh_token": "Google no entregó el permiso permanente. Volvé a la app y probá de nuevo.",
+    "miembro_de_familia": "Tu cuenta es parte de una familia y usa el Google del titular. Solo el titular puede conectarlo.",
     "permisos_incompletos": "Faltó tildar algún permiso. Volvé a la app, tocá el botón otra vez y en la pantalla de Google marcá TODAS las casillas (o \"Seleccionar todo\").",
 }
 
@@ -255,13 +256,24 @@ def _pagina_resultado(ok: bool, return_url: str, detalle: str | None = None) -> 
 async def get_google_auth_url(
     return_to: str | None = None,
     usuario: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """
     Requiere el token de Supabase (usuario logueado). Devuelve { url } para
     que el frontend la abra en el navegador del celular.
+
+    Familias (v2.5, regla 5): si quien llama es MIEMBRO de una familia, 409.
+    Solo el titular conecta Google; el miembro usa el Drive y el Calendar del titular.
     """
     if not STATE_SECRET:
         raise HTTPException(500, "Falta STATE_SECRET en el .env")
+
+    titular = await resolver_titular(db, usuario)
+    if titular.id != usuario.id:
+        raise HTTPException(
+            409,
+            "Tu familia usa la cuenta de Google del titular. Solo el titular puede conectarla.",
+        )
 
     flow = _build_flow()
 
@@ -284,8 +296,11 @@ async def get_google_auth_url(
 
 
 @router.get("/status")
-async def get_google_status(usuario: User = Depends(get_current_user)):
+async def get_google_status(usuario: User = Depends(get_data_owner)):
     """
+    Familias (v2.5, regla 5): `usuario` es el dueño de los datos, así que para un
+    MIEMBRO esto devuelve el estado de Google del TITULAR (nunca su token).
+
     Requiere el token de Supabase (usuario logueado). Le dice al frontend si
     esta cuenta YA conectó Google (existe google_refresh_token guardado) o
     no. Nunca devuelve el token en sí, solo un booleano — el frontend lo usa
@@ -329,6 +344,15 @@ async def google_callback(request: Request, db: AsyncSession = Depends(get_db)):
     # Casteo explícito a UUID: asyncpg es estricto y si el WHERE recibe un
     # str puede tirar DataError al comparar contra la columna UUID.
     user_id = UUID(payload["user_id"])
+
+    # Familias (v2.5, regla 9): el miembro NUNCA guarda un google_refresh_token.
+    # Cubre el caso de alguien que empezó a conectar Google ANTES de unirse a una
+    # familia (el state dura 10 minutos) y termina el permiso ya siendo miembro.
+    persona = await db.get(User, user_id)
+    if persona is not None:
+        titular = await resolver_titular(db, persona)
+        if titular.id != persona.id:
+            return _pagina_resultado(False, return_url, "miembro_de_familia")
 
     flow = _build_flow()
     try:

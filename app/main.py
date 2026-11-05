@@ -1028,6 +1028,7 @@ async def eliminar_cuenta(
     """
     Elimina la cuenta de quien llama.
       - Se borran sus hijos, documentos y turnos de la base, y su usuario de Supabase Auth.
+      - Si es titular de una familia, la familia se disuelve; si es miembro, solo sale de ella.
       - NO se borran los archivos de Google Drive ni los eventos de Google
         Calendar: quedan en la cuenta de Google de la persona.
       - Se revoca el permiso de Google (mejor esfuerzo). Sin usuario, el
@@ -1043,6 +1044,15 @@ async def eliminar_cuenta(
 
     user_id = usuario.id
     refresh_token = usuario.google_refresh_token
+
+    # Familias (v2.5, regla 6): si quien elimina es el TITULAR, se disuelve la
+    # familia y el miembro queda con una cuenta vacía. Si es el MIEMBRO, solo
+    # se va: sus datos propios (vacíos) se borran y los del titular no se tocan.
+    # El miembro no tiene token de Google propio, así que nunca se revoca el del titular.
+    if usuario.family_id is not None:
+        familia = await crud.get_family(db, usuario.family_id)
+        if familia is not None and familia.owner_id == usuario.id:
+            await crud.dissolve_family(db, familia.id)
 
     await crud.delete_user(db, usuario)
 
