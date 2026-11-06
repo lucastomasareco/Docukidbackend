@@ -257,6 +257,298 @@ def delete_file_from_drive(user: User, drive_file_id: str) -> None:
         raise
 
 # ---------------------------------------------------------------------------
+# Drive por hijo (v2.6, Guía §13)
+# ---------------------------------------------------------------------------
+# Estructura nueva:
+#     Docukids / {IDhijo}_{Nombre} / {Carpeta} / {IDhijo}_{Nombre}_{Doc}_{IDdoc}.{ext}
+#     ej.:  Docukids / 12_Ana / Salud / 12_Ana_Cartilla_57.pdf
+# El ID del hijo (único en toda la base) evita que dos hijos con el mismo
+# nombre compartan carpeta o tengan archivos indistinguibles.
+# Las carpetas se guardan y se buscan SIEMPRE por ID de Drive, nunca por nombre.
+# Las funciones de esta sección son nuevas: las usan los pasos 3 a 6 del plan.
+
+# Extensión del archivo según el tipo real detectado (magic numbers en /upload).
+EXTENSION_POR_MIME = {
+    "application/pdf": "pdf",
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/heic": "heic",
+}
+
+_MAX_NOMBRE_DRIVE = 255  # largo máximo de un nombre en Drive
+
+
+def sanear_nombre(s: str) -> str:
+    """Quita caracteres peligrosos o de ruta. Misma regla que _safe_filename de main.py."""
+    s = re.sub(r"[^\w\s\-.]", "_", s or "", flags=re.UNICODE)
+    return s.strip()[:200] or "documento"
+
+
+def nombre_carpeta_hijo(child_id: int, child_name: str) -> str:
+    """Nombre de la carpeta del hijo: '{IDhijo}_{Nombre}'. Ej.: '12_Ana'."""
+    return f"{child_id}_{sanear_nombre(child_name)}"
+
+
+def armar_nombre_archivo(
+    child_id: int,
+    child_name: str,
+    doc_name: str,
+    doc_id: Optional[int] = None,
+    ext: Optional[str] = None,
+) -> str:
+    """
+    Nombre del archivo en Drive: '{IDhijo}_{Nombre}_{Doc}_{IDdoc}.{ext}'.
+    Ej.: '12_Ana_Cartilla_57.pdf'.
+    - doc_id=None arma el nombre PROVISIONAL de la subida (sin ID de documento,
+      que recién existe después del INSERT); luego se renombra con el ID.
+    - ext=None no agrega extensión. Si el nombre del documento ya termina con
+      esa extensión (ej. 'DNI.pdf'), no se repite ('.pdf.pdf').
+    - El resultado nunca supera los 255 caracteres de Drive: se recorta la
+      parte {Doc}, nunca el ID ni la extensión.
+    """
+    ext = (ext or "").lstrip(".").lower()
+    doc = sanear_nombre(doc_name)
+    if ext and doc.lower().endswith("." + ext):
+        doc = doc[: -(len(ext) + 1)].rstrip() or "documento"
+
+    prefijo = nombre_carpeta_hijo(child_id, child_name)
+    sufijo = (f"_{doc_id}" if doc_id is not None else "") + (f".{ext}" if ext else "")
+    # +1 por el "_" que separa el prefijo del {Doc}
+    espacio_doc = _MAX_NOMBRE_DRIVE - len(prefijo) - 1 - len(sufijo)
+    if espacio_doc < 1:  # nombre de hijo absurdamente largo: se recorta el prefijo
+        prefijo = prefijo[: max(1, _MAX_NOMBRE_DRIVE - len(sufijo) - 2)]
+        espacio_doc = _MAX_NOMBRE_DRIVE - len(prefijo) - 1 - len(sufijo)
+    return f"{prefijo}_{doc[: max(1, espacio_doc)]}{sufijo}"
+
+
+def _crear_carpeta_en(drive_service, nombre: str, padre_id: str) -> str:
+    """Crea la carpeta `nombre` dentro de `padre_id` y devuelve su id."""
+    metadata = {"name": nombre, "mimeType": _MIME_CARPETA, "parents": [padre_id]}
+    carpeta = drive_service.files().create(body=metadata, fields="id").execute()
+    return carpeta["id"]
+
+
+def _asegurar_carpeta_hijo(
+    drive_service, child_id: int, child_name: str, drive_folder_id: Optional[str]
+) -> str:
+    """
+    Devuelve el id de la carpeta del hijo, que EXISTE: la guardada, o una nueva
+    dentro de 'Docukids' si nunca se creó o la borraron a mano / está en la papelera.
+    """
+    if drive_folder_id and _subcarpeta_vive(drive_service, drive_folder_id):
+        return drive_folder_id
+    raiz_id = _get_or_create_carpeta(drive_service)
+    return _crear_carpeta_en(drive_service, nombre_carpeta_hijo(child_id, child_name), raiz_id)
+
+
+def _asegurar_subcarpeta_de_hijo(
+    drive_service, carpeta_hijo_id: str, nombre: str, drive_folder_id: Optional[str]
+) -> str:
+    """
+    Devuelve el id de la subcarpeta `nombre` DENTRO de la carpeta del hijo, que
+    EXISTE: la guardada, o una nueva si falta. Si la guardada vive pero está
+    fuera de la carpeta de este hijo no se reutiliza (nunca se mezclan hermanos).
+    """
+    if drive_folder_id and _subcarpeta_vive_en(drive_service, drive_folder_id, carpeta_hijo_id):
+        return drive_folder_id
+    return _crear_carpeta_en(drive_service, nombre, carpeta_hijo_id)
+
+
+def _subcarpeta_vive_en(drive_service, drive_folder_id: str, padre_id: str) -> bool:
+    """True si la carpeta existe, no está en la papelera y su padre es `padre_id`."""
+    try:
+        carpeta = drive_service.files().get(
+            fileId=drive_folder_id, fields="id, trashed, parents"
+        ).execute()
+    except HttpError as error:
+        if _status(error) == 404:
+            return False
+        raise
+    return (not carpeta.get("trashed", False)) and padre_id in (carpeta.get("parents") or [])
+
+
+@traducir_permisos_de_google("Google Drive")
+def upload_file_to_child_folder(
+    user: User,
+    file_bytes: bytes,
+    filename: str,
+    mime_type: str,
+    child_id: int,
+    child_name: str,
+    child_drive_folder_id: Optional[str],
+    folder_name: Optional[str] = None,
+    child_folder_drive_id: Optional[str] = None,
+) -> Tuple[str, str, str, Optional[str]]:
+    """
+    Sube el archivo a la carpeta del hijo (la crea si falta) y, si el documento
+    tiene carpeta de la app (`folder_name`), a la subcarpeta de ESE hijo.
+    Sin `folder_name`, el archivo queda directo en la carpeta del hijo.
+
+    Devuelve (drive_file_id, drive_link, id_carpeta_hijo_vigente,
+    id_subcarpeta_vigente_o_None). El llamador debe guardar los ids vigentes
+    que hayan cambiado (children.drive_folder_id y child_folders).
+    """
+    drive_service = _drive(user)
+    hijo_id = _asegurar_carpeta_hijo(drive_service, child_id, child_name, child_drive_folder_id)
+    destino_id = hijo_id
+    sub_id = None
+    if folder_name is not None:
+        sub_id = _asegurar_subcarpeta_de_hijo(drive_service, hijo_id, folder_name, child_folder_drive_id)
+        destino_id = sub_id
+    archivo_id, link = _subir(drive_service, destino_id, file_bytes, filename, mime_type)
+    return archivo_id, link, hijo_id, sub_id
+
+
+@traducir_permisos_de_google("Google Drive")
+def renombrar_archivo_en_drive(user: User, drive_file_id: str, nuevo_nombre: str) -> bool:
+    """
+    Cambia el nombre de un archivo en Drive (se usa para ponerle el ID del
+    documento después del INSERT). Devuelve True si se renombró y False si el
+    archivo ya no existe (404). Otros errores se propagan: el llamador decide
+    (en /upload no se deshace nada si el renombrado falla).
+    """
+    drive_service = _drive(user)
+    try:
+        drive_service.files().update(
+            fileId=drive_file_id, body={"name": nuevo_nombre}, fields="id"
+        ).execute()
+    except HttpError as error:
+        if _status(error) == 404:
+            logger.info("Archivo %s ya no existe en Drive; no se renombra.", drive_file_id)
+            return False
+        raise
+    return True
+
+
+@traducir_permisos_de_google("Google Drive")
+def mover_archivo_a_carpeta_de_hijo(
+    user: User,
+    drive_file_id: str,
+    child_id: int,
+    child_name: str,
+    child_drive_folder_id: Optional[str],
+    folder_name: Optional[str],
+    child_folder_drive_id: Optional[str],
+) -> Tuple[str, Optional[str]]:
+    """
+    Mueve el archivo DENTRO del mismo hijo: a su subcarpeta `folder_name`, o
+    directo a la carpeta del hijo si folder_name es None. Nunca cambia de hijo.
+    Devuelve (id_carpeta_hijo_vigente, id_subcarpeta_vigente_o_None); el llamador
+    guarda los que hayan cambiado. Si el archivo ya no existe en Drive (404),
+    no se mueve nada y no es error.
+    """
+    drive_service = _drive(user)
+    hijo_id = _asegurar_carpeta_hijo(drive_service, child_id, child_name, child_drive_folder_id)
+    destino_id = hijo_id
+    sub_id = None
+    if folder_name is not None:
+        sub_id = _asegurar_subcarpeta_de_hijo(drive_service, hijo_id, folder_name, child_folder_drive_id)
+        destino_id = sub_id
+    try:
+        _mover(drive_service, drive_file_id, destino_id)
+    except HttpError as error:
+        if _status(error) != 404:
+            raise
+        logger.info("Archivo %s ya no existe en Drive; no se mueve.", drive_file_id)
+    return hijo_id, sub_id
+
+
+def _carpeta_vacia(drive_service, carpeta_id: str) -> bool:
+    """True si la carpeta no tiene nada adentro (sin contar lo que está en la papelera)."""
+    resultado = drive_service.files().list(
+        q=f"'{carpeta_id}' in parents and trashed=false",
+        spaces="drive",
+        fields="files(id)",
+        pageSize=1,
+    ).execute()
+    return not resultado.get("files")
+
+
+def _borrar_carpeta_si_vacia(drive_service, carpeta_id: str) -> bool:
+    """
+    Borra la carpeta SOLO si está vacía. Devuelve True si ya no existe (la
+    borró o ya no estaba) y False si se conserva porque tiene algo adentro.
+    Un 404 se ignora; cualquier otro error se propaga.
+    """
+    try:
+        if not _carpeta_vacia(drive_service, carpeta_id):
+            return False
+        drive_service.files().delete(fileId=carpeta_id).execute()
+    except HttpError as error:
+        if _status(error) != 404:
+            raise
+    return True
+
+
+@traducir_permisos_de_google("Google Drive")
+def borrar_carpeta_de_hijo_si_vacia(
+    user: User,
+    child_drive_folder_id: Optional[str],
+    sub_drive_folder_ids: List[str],
+) -> bool:
+    """
+    Al borrar un hijo (sus archivos ya se borraron): limpia su carpeta de Drive.
+    Primero borra las subcarpetas conocidas del hijo (Salud, Escuela, ...) que
+    estén vacías y después la carpeta del hijo, también solo si quedó vacía.
+    Si la persona puso algo a mano, eso NO se toca: la carpeta (y la subcarpeta
+    que lo contiene) se conservan. Devuelve True si la carpeta del hijo ya no
+    existe. Un 404 de Google se ignora; otro error se propaga para que el
+    llamador no borre nada de la base.
+    """
+    drive_service = _drive(user)
+    for sub_id in sub_drive_folder_ids:
+        _borrar_carpeta_si_vacia(drive_service, sub_id)
+    if not child_drive_folder_id:
+        return False
+    return _borrar_carpeta_si_vacia(drive_service, child_drive_folder_id)
+
+
+@traducir_permisos_de_google("Google Drive")
+def borrar_subcarpeta_de_hijo(
+    user: User,
+    child_id: int,
+    child_name: str,
+    child_drive_folder_id: Optional[str],
+    sub_drive_folder_id: Optional[str],
+    drive_file_ids: List[str],
+) -> Optional[str]:
+    """
+    Al borrar una carpeta de la app, para UN hijo: sus archivos pasan a la
+    carpeta de ese hijo (nunca a la de un hermano ni a la raíz) y después se
+    borra su subcarpeta, SOLO si quedó vacía (si la persona puso algo a mano, se
+    conserva). Nunca se borra un archivo. Un 404 (archivo o carpeta que ya no
+    existe) se ignora; cualquier otro error se propaga para que el llamador no
+    borre nada de la base.
+    Devuelve el id vigente de la carpeta del hijo (None si no hizo falta
+    tocarla); el llamador lo guarda si cambió.
+    """
+    drive_service = _drive(user)
+    hijo_id = child_drive_folder_id
+    if drive_file_ids:
+        hijo_id = _asegurar_carpeta_hijo(drive_service, child_id, child_name, child_drive_folder_id)
+        for archivo_id in drive_file_ids:
+            try:
+                _mover(drive_service, archivo_id, hijo_id)
+            except HttpError as error:
+                if _status(error) == 404:
+                    continue
+                raise
+    if sub_drive_folder_id:
+        _borrar_carpeta_si_vacia(drive_service, sub_drive_folder_id)
+    return hijo_id
+
+
+@traducir_permisos_de_google("Google Drive")
+def borrar_carpeta_si_vacia(user: User, drive_folder_id: str) -> bool:
+    """
+    Borra una carpeta de Drive SOLO si está vacía (se usa con las carpetas de la
+    estructura anterior a la v2.6). Devuelve True si ya no existe.
+    """
+    return _borrar_carpeta_si_vacia(_drive(user), drive_folder_id)
+
+
+# ---------------------------------------------------------------------------
 # Miniaturas (v2.4): GET /documents/{doc_id}/thumbnail
 # ---------------------------------------------------------------------------
 # Drive genera miniaturas de fotos y de PDF (primera página). El enlace

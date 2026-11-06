@@ -183,6 +183,20 @@ class DeleteResponse(BaseModel):
     message: str
 
 
+class MigrateResponse(BaseModel):
+    """
+    Respuesta de POST /drive/migrate (Drive por hijo, v2.6). Se vuelve a llamar
+    hasta que remaining sea 0.
+      - migrated:  archivos que quedaron en su carpeta de hijo y con su nombre nuevo.
+      - skipped:   archivos que ya no existen en Drive (o están en la papelera); el
+                   documento NO se borra, solo se da por revisado.
+      - remaining: documentos que todavía faltan.
+    """
+    migrated: int
+    skipped: int
+    remaining: int
+
+
 # ---------- Turnos (appointments) ----------
 
 class AppointmentCreate(BaseModel):

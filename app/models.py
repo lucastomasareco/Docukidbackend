@@ -85,6 +85,9 @@ class Child(Base):
     name = Column(Text, nullable=False)
     birth_date = Column(Date, nullable=True)
     avatar_url = Column(Text, nullable=True)
+    # Carpeta del hijo en Drive: "Docukids / {IDhijo}_{Nombre}" (v2.6, Guía §13).
+    # NULL = todavía no se creó (se crea al primer uso, o de nuevo si la borraron a mano).
+    drive_folder_id = Column(Text, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
 
     owner = relationship("User", back_populates="children")
@@ -168,6 +171,22 @@ class Folder(Base):
     # ID de la carpeta en Drive. NULL = todavía no se creó en Drive (se crea
     # al primer uso, o de nuevo si la persona la borró a mano).
     drive_folder_id = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+
+
+class ChildFolder(Base):
+    """
+    Subcarpeta (Salud, Escuela, ...) de UN hijo en Drive (v2.6, Guía §13).
+    Las carpetas de la app (tabla folders) son por usuario, pero en Drive hay
+    una por cada hijo; esta tabla guarda el id de esa subcarpeta para cada par
+    (hijo, carpeta). La crea supabase/migrations/add_child_drive_folders.sql.
+    Si se borra el hijo o la carpeta, la fila se borra sola (CASCADE).
+    """
+    __tablename__ = "child_folders"
+
+    child_id = Column(Integer, ForeignKey("children.id", ondelete="CASCADE"), primary_key=True)
+    folder_id = Column(Integer, ForeignKey("folders.id", ondelete="CASCADE"), primary_key=True)
+    drive_folder_id = Column(Text, nullable=False)
     created_at = Column(TIMESTAMP, server_default=func.now())
 
 

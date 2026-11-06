@@ -61,16 +61,20 @@ from .config import settings
 from .calendar_sync import actualizar_evento, crear_evento, borrar_evento
 from .database import get_db
 from .drive_upload import (
-    borrar_carpeta_de_drive,
-    crear_carpeta_en_drive,
-    delete_file_from_drive,
+    EXTENSION_POR_MIME,
     PX_MINIATURA,
     SinMiniatura,
-    mover_archivo_a_carpeta,
+    armar_nombre_archivo,
+    borrar_carpeta_de_hijo_si_vacia,
+    borrar_carpeta_si_vacia,
+    borrar_subcarpeta_de_hijo,
+    delete_file_from_drive,
+    mover_archivo_a_carpeta_de_hijo,
+    nombre_carpeta_hijo,
     obtener_miniatura_de_drive,
+    renombrar_archivo_en_drive,
     renombrar_carpeta_en_drive,
-    upload_file_to_drive,
-    upload_file_to_drive_folder,
+    upload_file_to_child_folder,
 )
 from .google_oauth import router as google_oauth_router
 from .models import User
@@ -166,7 +170,20 @@ async def editar_hijo(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Ese child_id no existe o no pertenece a tu usuario",
         )
-    hijo = await crud.update_child(db, hijo, datos.model_dump(exclude_unset=True))
+    cambios = datos.model_dump(exclude_unset=True)
+    # Drive por hijo (v2.6): si cambia el nombre, se renombra su carpeta en Drive
+    # ANTES de guardar (si Drive falla, no se guarda nada). Los archivos ya
+    # subidos conservan el nombre viejo: el ID del hijo en el nombre los sigue
+    # identificando. Si el hijo todavía no tiene carpeta, se creará con el
+    # nombre nuevo al primer uso.
+    if "name" in cambios and hijo.drive_folder_id and cambios["name"].strip() != hijo.name:
+        await run_in_threadpool(
+            renombrar_carpeta_en_drive,
+            usuario,
+            hijo.drive_folder_id,
+            nombre_carpeta_hijo(hijo.id, cambios["name"].strip()),
+        )
+    hijo = await crud.update_child(db, hijo, cambios)
     return ChildResponse(child=ChildOut.model_validate(hijo))
 
 @app.delete("/children/{child_id}", response_model=DeleteResponse)
@@ -202,6 +219,16 @@ async def borrar_hijo(
     for turno in turnos:
         if turno.calendar_event_id:
             await run_in_threadpool(borrar_evento, usuario, turno.calendar_event_id)
+
+    # Drive por hijo (v2.6): con sus archivos ya borrados, se limpia su carpeta
+    # (y sus subcarpetas) SOLO si quedaron vacías. Si la persona puso algo a
+    # mano, eso no se toca. Un error de Google (que no sea 404) corta acá y no
+    # se borra nada de la base.
+    sub_ids = await crud.get_child_folder_drive_ids(db, child_id)
+    if hijo.drive_folder_id or sub_ids:
+        await run_in_threadpool(
+            borrar_carpeta_de_hijo_si_vacia, usuario, hijo.drive_folder_id, sub_ids
+        )
 
     await crud.delete_child(db, hijo)
     return DeleteResponse(message="Deleted")
@@ -310,37 +337,45 @@ async def subir_documento(
     # Usamos el MIME real detectado, no el que envió el cliente (evita falsos positivos con HEIC, etc.)
     mime_type = mime_real
 
-    # --- Fase 2, paso 2: subida real a Drive ---
-    # Si el usuario todavía no conectó su cuenta de Google, upload_file_to_drive
-    # levanta un HTTPException 400 clara pidiendo pasar primero por
-    # GET /auth/google/url (ver drive_upload.py).
-    nombre_archivo = f"{_safe_filename(hijo.name)} - {_safe_filename(name)}"
-    if carpeta is None:
-        drive_file_id, drive_link = await run_in_threadpool(
-            upload_file_to_drive,
-            user=usuario,
-            file_bytes=contenido,
-            filename=nombre_archivo,
-            mime_type=mime_type,
-        )
-    else:
-        # Sube a la subcarpeta (la crea en Drive si todavía no existe o la borraron a mano).
-        drive_file_id, drive_link, drive_folder_vigente = await run_in_threadpool(
-            upload_file_to_drive_folder,
-            user=usuario,
-            file_bytes=contenido,
-            filename=nombre_archivo,
-            mime_type=mime_type,
-            folder_name=carpeta.name,
-            drive_folder_id=carpeta.drive_folder_id,
-        )
+    # --- Subida real a Drive, a la carpeta del hijo (v2.6, Guía §13) ---
+    # Drive: Docukids / {IDhijo}_{Nombre} / {Carpeta} / archivo. Si la persona
+    # todavía no conectó Google, drive_upload levanta un 400/401 claro.
+    # Guardamos ya los datos del hijo: tras un rollback, SQLAlchemy "olvida" los
+    # valores de los objetos cargados y no se pueden volver a leer.
+    hijo_id = hijo.id
+    hijo_nombre = hijo.name
+    ext = EXTENSION_POR_MIME.get(mime_type)
+    # El ID del documento no existe todavía: nombre provisional, que se
+    # renombra con el ID después del INSERT.
+    nombre_provisional = armar_nombre_archivo(hijo_id, hijo_nombre, name, None, ext)
+    sub_guardada = (
+        await crud.get_child_folder_drive_id(db, hijo_id, carpeta.id) if carpeta is not None else None
+    )
+    drive_file_id, drive_link, hijo_drive_vigente, sub_vigente = await run_in_threadpool(
+        upload_file_to_child_folder,
+        user=usuario,
+        file_bytes=contenido,
+        filename=nombre_provisional,
+        mime_type=mime_type,
+        child_id=hijo_id,
+        child_name=hijo_nombre,
+        child_drive_folder_id=hijo.drive_folder_id,
+        folder_name=carpeta.name if carpeta is not None else None,
+        child_folder_drive_id=sub_guardada,
+    )
+    try:
+        await crud.set_child_drive_folder_id(db, hijo, hijo_drive_vigente)
+        if carpeta is not None and sub_vigente:
+            await crud.set_child_folder_drive_id(db, hijo_id, carpeta.id, sub_vigente)
+    except Exception:
+        # No es grave: la próxima vez se vuelve a buscar o crear la carpeta.
+        logger.warning("No se pudo guardar el id de Drive de la carpeta del hijo %s.", hijo_id)
+        await db.rollback()
         try:
-            await crud.set_folder_drive_id(db, carpeta, drive_folder_vigente)
+            await db.refresh(usuario)  # el rollback también "olvida" al usuario
         except Exception:
-            # No es grave: la próxima vez se vuelve a buscar o crear la carpeta.
-            logger.warning("No se pudo guardar el id de Drive de la carpeta %s.", carpeta.id)
-            await db.rollback()
-    
+            pass
+
     # --- Fase 2, paso 3: OCR con Gemini para detectar la fecha de vencimiento ---
     # Nunca lanza excepción (ver ocr_reader.py): si falla, expiry_date queda
     # en None y el documento se guarda igual, con status "sin_fecha".
@@ -374,6 +409,15 @@ async def subir_documento(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="No se pudo guardar el documento. No se guardó nada; probá de nuevo.",
         )
+
+    # Ahora que existe el ID del documento, el archivo en Drive lo lleva en el
+    # nombre. Si falla NO se deshace nada: el archivo ya está en la carpeta del
+    # hijo y su nombre lleva el ID del hijo.
+    try:
+        nombre_final = armar_nombre_archivo(hijo_id, hijo_nombre, name, documento.id, ext)
+        await run_in_threadpool(renombrar_archivo_en_drive, usuario, drive_file_id, nombre_final)
+    except Exception:
+        logger.warning("No se pudo poner el ID del documento %s en el nombre del archivo de Drive.", documento.id)
 
     return UploadResponse(
         status=crud.compute_status(documento.expiry_date, documento.no_expiry),
@@ -437,15 +481,29 @@ async def actualizar_documento(
         if datos.folder_id is not None:
             carpeta = await _carpeta_propia_o_404(db, datos.folder_id, usuario.id)
         if documento.drive_file_id:
-            drive_folder_vigente = await run_in_threadpool(
-                mover_archivo_a_carpeta,
+            # Se mueve DENTRO del mismo hijo: nunca cambia de hijo (Guía §13, regla 2).
+            hijo = await crud.get_child_owned_by_user(db, documento.child_id, usuario.id)
+            if hijo is None:  # no debería pasar (el documento ya se validó como propio)
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Ese doc_id no existe o no pertenece a tu usuario",
+                )
+            sub_guardada = (
+                await crud.get_child_folder_drive_id(db, hijo.id, carpeta.id) if carpeta else None
+            )
+            hijo_vigente, sub_vigente = await run_in_threadpool(
+                mover_archivo_a_carpeta_de_hijo,
                 usuario,
                 documento.drive_file_id,
+                hijo.id,
+                hijo.name,
+                hijo.drive_folder_id,
                 carpeta.name if carpeta else None,
-                carpeta.drive_folder_id if carpeta else None,
+                sub_guardada,
             )
-            if carpeta is not None:
-                await crud.set_folder_drive_id(db, carpeta, drive_folder_vigente)
+            await crud.set_child_drive_folder_id(db, hijo, hijo_vigente)
+            if carpeta is not None and sub_vigente:
+                await crud.set_child_folder_drive_id(db, hijo.id, carpeta.id, sub_vigente)
 
     documento = await crud.update_document(
         db,
@@ -586,26 +644,15 @@ async def crear_carpeta(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Crea una carpeta en la base y, si la persona ya conectó Google, también en
-    Drive (subcarpeta de "Docukids"). Sin Google conectado se crea igual en la
-    base y en Drive se crea al primer uso.
+    Crea una carpeta SOLO en la base. Drive por hijo (v2.6): la subcarpeta de
+    cada hijo se crea al primer uso (al subir o mover un documento a ella).
     """
     if await crud.folder_name_exists(db, usuario.id, datos.name):
         raise _nombre_repetido()
-
-    drive_folder_id = None
-    if usuario.google_refresh_token:
-        drive_folder_id = await run_in_threadpool(crear_carpeta_en_drive, usuario, datos.name)
-
     try:
-        carpeta = await crud.create_folder(db, usuario.id, datos.name, drive_folder_id)
+        carpeta = await crud.create_folder(db, usuario.id, datos.name)
     except IntegrityError:
         await db.rollback()
-        if drive_folder_id:
-            try:
-                await run_in_threadpool(borrar_carpeta_de_drive, usuario, drive_folder_id, [])
-            except Exception:
-                logger.warning("No se pudo limpiar la carpeta de Drive %s tras un nombre repetido.", drive_folder_id)
         raise _nombre_repetido()
     return FolderResponse(folder=FolderOut.model_validate(carpeta))
 
@@ -617,15 +664,17 @@ async def renombrar_carpeta(
     usuario: User = Depends(get_data_owner),
     db: AsyncSession = Depends(get_db),
 ):
-    """Renombra la carpeta (también las de base). Primero Drive y después la base."""
+    """Renombra la carpeta (también las de base) y la subcarpeta de cada hijo. Primero Drive y después la base."""
     carpeta = await _carpeta_propia_o_404(db, folder_id, usuario.id)
     if datos.name == carpeta.name:
         return FolderResponse(folder=FolderOut.model_validate(carpeta))
     if await crud.folder_name_exists(db, usuario.id, datos.name, exclude_id=carpeta.id):
         raise _nombre_repetido()
 
-    if carpeta.drive_folder_id:
-        await run_in_threadpool(renombrar_carpeta_en_drive, usuario, carpeta.drive_folder_id, datos.name)
+    # Drive por hijo (v2.6): se renombra la subcarpeta de CADA hijo que ya exista.
+    # Si Google falla en alguna, no se guarda nada en la base (se puede reintentar).
+    for fila in await crud.get_child_folders_of_folder(db, carpeta.id):
+        await run_in_threadpool(renombrar_carpeta_en_drive, usuario, fila.drive_folder_id, datos.name)
     try:
         carpeta = await crud.rename_folder(db, carpeta, datos.name)
     except IntegrityError:
@@ -641,10 +690,11 @@ async def borrar_carpeta(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Borra una carpeta que no sea de base. NUNCA borra documentos: primero los
-    archivos pasan a la raíz "Docukids" en Drive, después se borra la carpeta
-    de Drive y por último la fila (los documentos quedan con folder_id = NULL).
-    Si Drive falla por algo distinto de un 404, no se borra nada de la base.
+    Borra una carpeta que no sea de base. NUNCA borra documentos. Drive por hijo
+    (v2.6): para cada hijo, sus archivos de esa carpeta pasan a la carpeta DE ESE
+    HIJO y se borra su subcarpeta si quedó vacía; después se borra la fila (los
+    documentos quedan con folder_id = NULL). Si Google falla por algo distinto
+    de un 404, no se borra nada de la base.
     """
     carpeta = await _carpeta_propia_o_404(db, folder_id, usuario.id)
     if carpeta.is_base:
@@ -653,10 +703,32 @@ async def borrar_carpeta(
             detail="Las carpetas Documentos, Salud y Escuela no se pueden borrar (sí renombrar).",
         )
 
+    documentos = await crud.get_documents_in_folder(db, carpeta.id)
+    archivos_por_hijo = {}
+    for d in documentos:
+        if d.drive_file_id:
+            archivos_por_hijo.setdefault(d.child_id, []).append(d.drive_file_id)
+    subcarpetas = {f.child_id: f.drive_folder_id for f in await crud.get_child_folders_of_folder(db, carpeta.id)}
+
+    for child_id in set(archivos_por_hijo) | set(subcarpetas):
+        hijo = await crud.get_child_owned_by_user(db, child_id, usuario.id)
+        if hijo is None:  # no debería pasar; si pasara, no hay a quién mover nada
+            continue
+        hijo_vigente = await run_in_threadpool(
+            borrar_subcarpeta_de_hijo,
+            usuario,
+            hijo.id,
+            hijo.name,
+            hijo.drive_folder_id,
+            subcarpetas.get(child_id),
+            archivos_por_hijo.get(child_id, []),
+        )
+        if hijo_vigente:
+            await crud.set_child_drive_folder_id(db, hijo, hijo_vigente)
+
+    # Carpeta de la estructura anterior a la v2.6 (ya sin uso): se borra solo si quedó vacía.
     if carpeta.drive_folder_id:
-        documentos = await crud.get_documents_in_folder(db, carpeta.id)
-        archivos = [d.drive_file_id for d in documentos if d.drive_file_id]
-        await run_in_threadpool(borrar_carpeta_de_drive, usuario, carpeta.drive_folder_id, archivos)
+        await run_in_threadpool(borrar_carpeta_si_vacia, usuario, carpeta.drive_folder_id)
 
     await crud.delete_folder(db, carpeta)
     return DeleteResponse(message="Deleted")

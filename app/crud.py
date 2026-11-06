@@ -19,7 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import settings
-from .models import Appointment, Child, Document, Family, Folder, User
+from .models import Appointment, Child, ChildFolder, Document, Family, Folder, User
 
 
 # ---------- Configuración de zona horaria ----------
@@ -328,6 +328,60 @@ async def set_folder_drive_id(db: AsyncSession, carpeta: Folder, drive_folder_id
     carpeta.drive_folder_id = drive_folder_id
     await db.commit()
     await db.refresh(carpeta)
+
+
+# ---------- Drive por hijo (v2.6, Guía §13) ----------
+
+async def set_child_drive_folder_id(db: AsyncSession, hijo: Child, drive_folder_id: Optional[str]) -> None:
+    """Guarda el id de la carpeta del hijo en Drive (se crea al primer uso o se recrea si la borraron)."""
+    if hijo.drive_folder_id == drive_folder_id:
+        return
+    hijo.drive_folder_id = drive_folder_id
+    await db.commit()
+    await db.refresh(hijo)
+
+
+async def get_child_folder_drive_id(db: AsyncSession, child_id: int, folder_id: int) -> Optional[str]:
+    """Id en Drive de la subcarpeta `folder_id` DE ESTE HIJO (None = todavía no creada)."""
+    result = await db.execute(
+        select(ChildFolder.drive_folder_id).where(
+            ChildFolder.child_id == child_id, ChildFolder.folder_id == folder_id
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_child_folders_of_folder(db: AsyncSession, folder_id: int) -> Sequence[ChildFolder]:
+    """Las subcarpetas de Drive (una por hijo) que tiene una carpeta de la app."""
+    result = await db.execute(select(ChildFolder).where(ChildFolder.folder_id == folder_id))
+    return result.scalars().all()
+
+
+async def get_child_folder_drive_ids(db: AsyncSession, child_id: int) -> list:
+    """Ids en Drive de TODAS las subcarpetas de este hijo (para limpiarlas al borrarlo)."""
+    result = await db.execute(
+        select(ChildFolder.drive_folder_id).where(ChildFolder.child_id == child_id)
+    )
+    return list(result.scalars().all())
+
+
+async def set_child_folder_drive_id(
+    db: AsyncSession, child_id: int, folder_id: int, drive_folder_id: str
+) -> None:
+    """Guarda (o actualiza) el id en Drive de la subcarpeta de este hijo."""
+    result = await db.execute(
+        select(ChildFolder).where(
+            ChildFolder.child_id == child_id, ChildFolder.folder_id == folder_id
+        )
+    )
+    fila = result.scalar_one_or_none()
+    if fila is None:
+        db.add(ChildFolder(child_id=child_id, folder_id=folder_id, drive_folder_id=drive_folder_id))
+    elif fila.drive_folder_id == drive_folder_id:
+        return
+    else:
+        fila.drive_folder_id = drive_folder_id
+    await db.commit()
 
 
 async def get_documents_in_folder(db: AsyncSession, folder_id: int) -> Sequence[Document]:
