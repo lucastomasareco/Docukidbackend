@@ -642,6 +642,45 @@ def migrar_archivo(
 
 
 # ---------------------------------------------------------------------------
+# Eliminar cuenta con Drive (v2.7, Guía §14): DELETE /account?delete_drive=true
+# ---------------------------------------------------------------------------
+
+def _buscar_carpetas_raiz(drive_service) -> List[str]:
+    """Ids de las carpetas 'Docukids' vivas. A diferencia de _get_or_create_carpeta, NUNCA crea nada."""
+    query = (
+        f"name='{DRIVE_FOLDER_NAME}' and mimeType='{_MIME_CARPETA}' and trashed=false"
+    )
+    resultado = drive_service.files().list(
+        q=query, spaces="drive", fields="files(id)"
+    ).execute()
+    return [f["id"] for f in resultado.get("files", [])]
+
+
+@traducir_permisos_de_google("Google Drive")
+def enviar_docukids_a_papelera(user: User) -> int:
+    """
+    Manda a la PAPELERA de Drive la carpeta 'Docukids' del usuario (con ella van las
+    carpetas de cada hijo y sus archivos). No borra nada para siempre: la persona puede
+    recuperarlo desde la papelera durante unos 30 días. Si 'Docukids' no existe (la
+    borró a mano o nunca subió nada) no es error. Un 404 se ignora; cualquier otro
+    error se propaga para que el llamador NO borre nada de la base.
+    Devuelve cuántas carpetas mandó a la papelera.
+    """
+    drive_service = _drive(user)
+    enviadas = 0
+    for carpeta_id in _buscar_carpetas_raiz(drive_service):
+        try:
+            drive_service.files().update(
+                fileId=carpeta_id, body={"trashed": True}, fields="id"
+            ).execute()
+            enviadas += 1
+        except HttpError as error:
+            if _status(error) != 404:
+                raise
+    return enviadas
+
+
+# ---------------------------------------------------------------------------
 # Miniaturas (v2.4): GET /documents/{doc_id}/thumbnail
 # ---------------------------------------------------------------------------
 # Drive genera miniaturas de fotos y de PDF (primera página). El enlace

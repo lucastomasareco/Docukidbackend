@@ -32,7 +32,7 @@ POST   /family/join            -> unirse a una familia con un código
 POST   /family/leave           -> el miembro sale de la familia
 DELETE /family/members/{id}    -> el titular quita al miembro
 DELETE /family                 -> el titular disuelve la familia
-DELETE /account                -> elimina la cuenta: datos de la app + usuario de Supabase Auth (Drive y Calendar NO se tocan)
+DELETE /account                -> elimina la cuenta: datos de la app + usuario de Supabase Auth. ?delete_drive=true manda 'Docukids' a la papelera de Drive (por defecto false: Drive se conserva). Calendar NO se toca
 GET    /appointments/{child_id} -> lista los turnos de un hijo
 POST   /scheduler/check         -> lo llama cron-job.org 1 vez al día; manda los avisos pendientes
 /upload ahora hace, en este orden: valida el hijo y el tipo de archivo,
@@ -72,6 +72,7 @@ from .drive_upload import (
     borrar_carpeta_si_vacia,
     borrar_subcarpeta_de_hijo,
     delete_file_from_drive,
+    enviar_docukids_a_papelera,
     migrar_archivo,
     mover_archivo_a_carpeta_de_hijo,
     nombre_carpeta_hijo,
@@ -1183,6 +1184,7 @@ async def disolver_familia(
 # ---------- /account ----------
 @app.delete("/account", response_model=DeleteResponse)
 async def eliminar_cuenta(
+    delete_drive: bool = False,
     usuario: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1190,8 +1192,11 @@ async def eliminar_cuenta(
     Elimina la cuenta de quien llama.
       - Se borran sus hijos, documentos y turnos de la base, y su usuario de Supabase Auth.
       - Si es titular de una familia, la familia se disuelve; si es miembro, solo sale de ella.
-      - NO se borran los archivos de Google Drive ni los eventos de Google
-        Calendar: quedan en la cuenta de Google de la persona.
+      - Archivos de Google Drive (v2.7, Guía §14): por defecto NO se tocan. Con
+        ?delete_drive=true la carpeta 'Docukids' va a la PAPELERA de Drive (no se
+        borra para siempre). Solo vale para el titular o quien no tiene familia: si
+        elimina un MIEMBRO se ignora, porque sus subidas están en el Drive del titular.
+      - Los eventos de Google Calendar nunca se borran.
       - Se revoca el permiso de Google (mejor esfuerzo). Sin usuario, el
         scheduler ya no le manda correos.
     Orden: primero la base, después Supabase Auth. Si Auth falla (502), la
@@ -1205,6 +1210,26 @@ async def eliminar_cuenta(
 
     user_id = usuario.id
     refresh_token = usuario.google_refresh_token
+
+    # Drive (v2.7, Guía §14): se hace PRIMERO, antes de tocar la base y de revocar el
+    # permiso de Google (después ya no habría token ni se sabría de quién es la carpeta).
+    # Si Drive falla, no se borra nada y la persona puede reintentar.
+    if delete_drive and refresh_token:
+        es_miembro = False
+        if usuario.family_id is not None:
+            familia_drive = await crud.get_family(db, usuario.family_id)
+            es_miembro = familia_drive is not None and familia_drive.owner_id != usuario.id
+        if not es_miembro:
+            try:
+                await run_in_threadpool(enviar_docukids_a_papelera, usuario)
+            except HTTPException:
+                raise
+            except Exception as error:
+                logger.error("No se pudo mandar Docukids a la papelera de Drive (%s).", type(error).__name__)
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="No se pudieron mover tus archivos de Drive a la papelera. No se eliminó nada: probá de nuevo en un momento.",
+                )
 
     # Familias (v2.5, regla 6): si quien elimina es el TITULAR, se disuelve la
     # familia y el miembro queda con una cuenta vacía. Si es el MIEMBRO, solo
