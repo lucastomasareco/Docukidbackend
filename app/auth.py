@@ -87,12 +87,33 @@ async def get_current_user(
             detail="El token no incluye un id de usuario (sub)",
         )
 
-    # Alta perezosa: la primera vez que este usuario válido llama a un endpoint
-    # protegido, creamos su fila en "users". No agrega columnas ni tablas.
+    return await obtener_o_crear_usuario(db, user_id, email)
+
+
+async def obtener_o_crear_usuario(db: AsyncSession, user_id, email) -> User:
+    """
+    Alta perezosa: la primera vez que este usuario válido llama a un endpoint
+    protegido, creamos su fila en "users". No agrega columnas ni tablas.
+
+    Cuenta eliminada y vuelta a registrar con el MISMO correo (v2.9): el JWT de una cuenta
+    ya eliminada sigue siendo válido hasta que vence (se verifica la firma, no se consulta a
+    Supabase Auth), así que un pedido tardío (otra pestaña, uno en vuelo mientras se eliminaba)
+    puede RECREAR una fila "huérfana" en users con ese correo. Como users.email es UNIQUE, al
+    registrarse de nuevo con ese correo el alta fallaba y TODOS los pedidos daban error 500.
+    Ahora, si el correo ya lo tiene otra fila (otro id), esa fila se libera cambiándole el
+    correo por uno inválido; no se borra nada.
+    """
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
 
     if user is None:
+        if email:
+            previo = (
+                await db.execute(select(User).where(User.email == email))
+            ).scalar_one_or_none()
+            if previo is not None and str(previo.id) != str(user_id):
+                previo.email = f"huerfano-{previo.id}@docukids.invalid"
+                await db.flush()
         user = User(id=user_id, email=email)
         db.add(user)
         await db.commit()
