@@ -44,6 +44,7 @@ probar todo de punta a punta -- ya no es código nuevo del backend.
 """
 import logging
 import re
+import unicodedata
 from datetime import timezone
 from typing import Literal, Optional
 from uuid import UUID
@@ -113,6 +114,7 @@ from .schemas import (
     InviteResponse,
     MigrateResponse,
     RecoverCandidate,
+    RecoverMatch,
     RecoverPreviewResponse,
     RecoverRequest,
     RecoverResponse,
@@ -829,6 +831,29 @@ async def migrar_drive(
 
 
 # ---------- Recuperar datos tras re-registro (v2.8) ----------
+SUFIJO_RECUPERADO = " - recuperado"
+
+
+def _clave_nombre(nombre: str) -> str:
+    """Para comparar nombres: sin tildes, sin mayúsculas y sin espacios de más ('Lucía' = 'lucia')."""
+    sin_tildes = "".join(
+        c for c in unicodedata.normalize("NFD", nombre or "") if unicodedata.category(c) != "Mn"
+    )
+    return " ".join(sin_tildes.casefold().split())
+
+
+def _hijo_con_mismo_nombre(hijos: list, nombre: str):
+    """
+    El hijo que ya existe con ese nombre. Si hay varios, se prefiere uno que todavía no
+    tenga carpeta propia en Drive (al que se le puede vincular la carpeta vieja).
+    """
+    clave = _clave_nombre(nombre)
+    iguales = [h for h in hijos if _clave_nombre(h.name) == clave]
+    if not iguales:
+        return None
+    return next((h for h in iguales if not h.drive_folder_id), iguales[0])
+
+
 def _contar_documentos(entrada: dict) -> int:
     return len(entrada["files"]) + sum(len(sub["files"]) for sub in entrada["subfolders"])
 
@@ -845,16 +870,27 @@ async def recuperar_vista_previa(
     """
     vinculadas = await crud.get_linked_child_drive_folder_ids(db, usuario.id)
     encontradas = await run_in_threadpool(escanear_carpetas_recuperables, usuario, vinculadas)
-    return RecoverPreviewResponse(candidates=[
-        RecoverCandidate(
+    hijos = list(await crud.get_children_by_user(db, usuario.id))
+    candidatas = []
+    for e in encontradas:
+        # Si dos carpetas viejas se llaman igual, la segunda ya no puede vincularse al mismo hijo.
+        existente = _hijo_con_mismo_nombre(hijos, e["name"])
+        match = None
+        if existente is not None:
+            puede = not existente.drive_folder_id and not any(
+                c.match is not None and c.match.child_id == existente.id and c.match.can_link
+                for c in candidatas
+            )
+            match = RecoverMatch(child_id=existente.id, name=existente.name, can_link=puede)
+        candidatas.append(RecoverCandidate(
             drive_folder_id=e["drive_folder_id"],
             name=e["name"],
             old_child_id=e["old_child_id"],
             documents=_contar_documentos(e),
             folders=[sub["name"] for sub in e["subfolders"]],
-        )
-        for e in encontradas
-    ])
+            match=match,
+        ))
+    return RecoverPreviewResponse(candidates=candidatas)
 
 
 async def _buscar_o_crear_carpeta_de_app(db: AsyncSession, usuario: User, nombre: str, existentes: list):
@@ -875,39 +911,54 @@ async def _buscar_o_crear_carpeta_de_app(db: AsyncSession, usuario: User, nombre
     return carpeta
 
 
-async def _recuperar_un_hijo(db: AsyncSession, usuario: User, entrada: dict, carpetas_app: list):
+async def _recuperar_un_hijo(
+    db: AsyncSession, usuario: User, entrada: dict, carpetas_app: list,
+    existente=None, nombre: Optional[str] = None,
+):
     """
-    Crea el hijo y reconecta SU carpeta vieja de Drive. La carpeta del hijo se vincula AL
-    FINAL: si algo falla a mitad, el hijo a medias se borra y se puede reintentar sin
-    duplicados (mientras no esté vinculada, la carpeta sigue apareciendo como recuperable).
+    Reconecta UNA carpeta vieja de Drive. Con `existente` (un hijo que la persona ya tiene
+    y que todavía no tiene carpeta en Drive) la vincula a ese hijo; sin él, crea un hijo.
+    La carpeta del hijo se vincula AL FINAL: si algo falla a mitad, se deshace lo hecho
+    (el hijo creado se borra; en uno existente solo se borran los documentos de este intento)
+    y se puede reintentar sin duplicados, porque mientras no esté vinculada la carpeta sigue
+    apareciendo como recuperable.
     """
-    hijo = await crud.create_child(db, usuario.id, entrada["name"], None)
+    if existente is not None:
+        hijo = existente
+    else:
+        hijo = await crud.create_child(db, usuario.id, nombre or entrada["name"], None)
     hijo_id = hijo.id  # después de un rollback el objeto queda vencido: se guarda el id aparte
+    creados = []
     try:
-        total = 0
         pendientes = [(None, entrada["files"])] + [(s, s["files"]) for s in entrada["subfolders"]]
         for sub, archivos in pendientes:
             carpeta = None
             nombre_sub = (sub["name"] or "").strip() if sub else ""
             if sub is not None and nombre_sub:
                 carpeta = await _buscar_o_crear_carpeta_de_app(db, usuario, nombre_sub, carpetas_app)
-                await crud.set_child_folder_drive_id(db, hijo.id, carpeta.id, sub["drive_folder_id"])
+                await crud.set_child_folder_drive_id(db, hijo_id, carpeta.id, sub["drive_folder_id"])
             for f in archivos:
-                await crud.create_document(
-                    db, hijo.id, f["doc_name"], None,
+                creados.append(await crud.create_document(
+                    db, hijo_id, f["doc_name"], None,
                     drive_file_id=f["drive_file_id"], drive_link=f["drive_link"],
                     folder_id=carpeta.id if carpeta is not None else None,
                     mime_type=f["mime_type"],
-                )
-                total += 1
+                ))
         await crud.set_child_drive_folder_id(db, hijo, entrada["drive_folder_id"])
     except Exception:
         await db.rollback()
-        a_borrar = await crud.get_child_owned_by_user(db, hijo_id, usuario.id)
-        if a_borrar is not None:
-            await crud.delete_child(db, a_borrar)
+        if existente is None:
+            a_borrar = await crud.get_child_owned_by_user(db, hijo_id, usuario.id)
+            if a_borrar is not None:
+                await crud.delete_child(db, a_borrar)
+        else:
+            for doc in creados:
+                try:
+                    await crud.delete_document(db, doc)
+                except Exception:
+                    pass
         raise
-    return hijo, total
+    return hijo, len(creados)
 
 
 @app.post("/drive/recover", response_model=RecoverResponse)
@@ -930,22 +981,36 @@ async def recuperar_datos(
     por_id = {e["drive_folder_id"]: e for e in encontradas}
 
     carpetas_app = list(await crud.get_folders_ensuring_base(db, usuario.id))
+    hijos_actuales = list(await crud.get_children_by_user(db, usuario.id))
     recuperados = []
     documentos = 0
     saltados = 0
+    vinculados = 0
     for drive_id in dict.fromkeys(datos.folders):  # sin repetidos, en orden
         entrada = por_id.get(drive_id)
         if entrada is None:
             saltados += 1
             continue
+        # Mismo nombre que un hijo que ya existe: si ese hijo no tiene carpeta propia en Drive
+        # se le vincula la carpeta vieja (sin hijos repetidos); si ya tiene archivos propios no
+        # se mezcla nada: la carpeta vieja se recupera como un perfil aparte, con otro nombre.
+        existente = _hijo_con_mismo_nombre(hijos_actuales, entrada["name"])
+        vincular = existente if (existente is not None and not existente.drive_folder_id) else None
+        nombre = entrada["name"] + SUFIJO_RECUPERADO if (existente is not None and vincular is None) else None
         try:
-            hijo, cantidad = await _recuperar_un_hijo(db, usuario, entrada, carpetas_app)
+            hijo, cantidad = await _recuperar_un_hijo(
+                db, usuario, entrada, carpetas_app, existente=vincular, nombre=nombre
+            )
         except Exception as error:
             logger.error("No se pudo recuperar una carpeta de hijo (%s).", type(error).__name__)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="No se pudo recuperar una de las carpetas. Lo ya recuperado quedó guardado: probá de nuevo.",
             )
+        if vincular is None:
+            hijos_actuales.append(hijo)
+        else:
+            vinculados += 1
         recuperados.append(ChildOut.model_validate(hijo))
         documentos += cantidad
         # Que la carpeta vieja siga la convención '{IDnuevo}_{Nombre}' (mejor esfuerzo; el
@@ -958,7 +1023,9 @@ async def recuperar_datos(
             logger.warning("No se pudo renombrar la carpeta recuperada (%s).", type(error).__name__)
 
     remaining = await crud.count_documents_to_migrate(db, usuario.id)
-    return RecoverResponse(recovered=recuperados, documents=documentos, skipped=saltados, remaining=remaining)
+    return RecoverResponse(
+        recovered=recuperados, documents=documentos, skipped=saltados, remaining=remaining, linked=vinculados
+    )
 
 
 # ---------- /appointments ----------

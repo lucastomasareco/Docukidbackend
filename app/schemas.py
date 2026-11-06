@@ -199,6 +199,16 @@ class MigrateResponse(BaseModel):
 
 # ---------- Recuperar datos tras re-registro (v2.8) ----------
 
+class RecoverMatch(BaseModel):
+    """Un hijo que la persona YA tiene con el mismo nombre que la carpeta vieja."""
+    child_id: int
+    name: str
+    # True: ese hijo todavía no tiene carpeta propia en Drive, así que la carpeta vieja se
+    # vincula a él (no se crea un hijo repetido). False: ya tiene archivos propios en Drive;
+    # para no mezclar ni pisar nada, la carpeta vieja se recupera como un perfil aparte.
+    can_link: bool
+
+
 class RecoverCandidate(BaseModel):
     """Una carpeta de hijo que quedó en Drive y todavía no está vinculada a ningún hijo."""
     drive_folder_id: str
@@ -206,6 +216,7 @@ class RecoverCandidate(BaseModel):
     old_child_id: int
     documents: int
     folders: List[str]
+    match: Optional[RecoverMatch] = None
 
 
 class RecoverPreviewResponse(BaseModel):
@@ -220,6 +231,7 @@ class RecoverRequest(BaseModel):
 class RecoverResponse(BaseModel):
     """
     - recovered: hijos recuperados (con su carpeta vieja ya vinculada, sin duplicar).
+    - linked:    cuántos de ellos ya existían (se vinculó la carpeta vieja a su perfil).
     - documents: documentos reconectados.
     - skipped:   ids pedidos que ya no existen o ya estaban vinculados (no es error).
     - remaining: documentos por renombrar; llamar a POST /drive/migrate hasta que sea 0.
@@ -228,6 +240,8 @@ class RecoverResponse(BaseModel):
     documents: int
     skipped: int
     remaining: int
+    # Cuántos de `recovered` son hijos que ya existían y recibieron su carpeta vieja.
+    linked: int = 0
 
 
 # ---------- Turnos (appointments) ----------
