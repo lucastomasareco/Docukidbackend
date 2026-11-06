@@ -645,10 +645,15 @@ def migrar_archivo(
 # Eliminar cuenta con Drive (v2.7, Guía §14): DELETE /account?delete_drive=true
 # ---------------------------------------------------------------------------
 
-def _buscar_carpetas_raiz(drive_service) -> List[str]:
-    """Ids de las carpetas 'Docukids' vivas. A diferencia de _get_or_create_carpeta, NUNCA crea nada."""
+def _buscar_carpetas_raiz(drive_service, en_papelera: bool = False) -> List[str]:
+    """
+    Ids de las carpetas 'Docukids'. Por defecto solo las vivas; con en_papelera=True, solo las
+    que están en la papelera (para poder recuperar lo que mandó "eliminar cuenta -> papelera").
+    NUNCA crea nada.
+    """
+    estado = "true" if en_papelera else "false"
     query = (
-        f"name='{DRIVE_FOLDER_NAME}' and mimeType='{_MIME_CARPETA}' and trashed=false"
+        f"name='{DRIVE_FOLDER_NAME}' and mimeType='{_MIME_CARPETA}' and trashed={estado}"
     )
     resultado = drive_service.files().list(
         q=query, spaces="drive", fields="files(id)"

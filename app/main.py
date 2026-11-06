@@ -62,7 +62,7 @@ from .auth import get_current_user, get_data_owner
 from .config import settings
 from .calendar_sync import actualizar_evento, crear_evento, borrar_evento
 from .database import get_db
-from .drive_recover import escanear_carpetas_recuperables
+from .drive_recover import escanear_carpetas_recuperables, restaurar_carpeta_de_papelera
 from .drive_upload import (
     EXTENSION_POR_MIME,
     PX_MINIATURA,
@@ -994,6 +994,19 @@ async def recuperar_datos(
         # Mismo nombre que un hijo que ya existe: si ese hijo no tiene carpeta propia en Drive
         # se le vincula la carpeta vieja (sin hijos repetidos); si ya tiene archivos propios no
         # se mezcla nada: la carpeta vieja se recupera como un perfil aparte, con otro nombre.
+        # La carpeta viene de la PAPELERA de Drive (cuenta eliminada con "mandar a la papelera"):
+        # se saca de ahí ANTES de tocar la base. Si falla, no se creó nada y se puede reintentar.
+        if entrada.get("en_papelera"):
+            try:
+                await run_in_threadpool(restaurar_carpeta_de_papelera, usuario, entrada)
+            except HTTPException:
+                raise
+            except Exception as error:
+                logger.error("No se pudo sacar la carpeta de la papelera de Drive (%s).", type(error).__name__)
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="No se pudo sacar tu carpeta de la papelera de Drive. No se recuperó nada: probá de nuevo.",
+                )
         existente = _hijo_con_mismo_nombre(hijos_actuales, entrada["name"])
         vincular = existente if (existente is not None and not existente.drive_folder_id) else None
         nombre = entrada["name"] + SUFIJO_RECUPERADO if (existente is not None and vincular is None) else None
@@ -1456,8 +1469,9 @@ async def eliminar_cuenta(
     # token guardado se borra igual junto con el usuario, así que la app no puede actuar
     # sobre ese Drive; la persona puede quitar el permiso cuando quiera desde su cuenta de
     # Google. Con delete_drive=true la carpeta ya va a la papelera, así que sí se revoca.
-    if refresh_token and delete_drive:
-        await revocar_permiso_de_google(refresh_token)
+    # v2.9: tampoco con delete_drive=true se revoca. Si se revocara, la app perdería el acceso a
+    # la carpeta que acaba de mandar a la papelera y no podría recuperarla al volver a registrarse.
+    # El token guardado se borró junto con el usuario: la app no puede actuar sobre ese Drive.
 
     await borrar_usuario_de_auth(user_id)
     return DeleteResponse(message="Deleted")
