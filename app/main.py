@@ -1402,8 +1402,10 @@ async def eliminar_cuenta(
         borra para siempre). Solo vale para el titular o quien no tiene familia: si
         elimina un MIEMBRO se ignora, porque sus subidas están en el Drive del titular.
       - Los eventos de Google Calendar nunca se borran.
-      - Se revoca el permiso de Google (mejor esfuerzo). Sin usuario, el
-        scheduler ya no le manda correos.
+      - Permiso de Google: se revoca (mejor esfuerzo) SOLO si delete_drive=true. Si
+        conserva Drive no se revoca, para poder recuperar sus carpetas al volver a
+        registrarse (ver comentario más abajo). Sin usuario, el scheduler ya no le
+        manda correos.
     Orden: primero la base, después Supabase Auth. Si Auth falla (502), la
     persona puede reintentar: no queda ningún dato suyo en la base.
     """
@@ -1447,7 +1449,14 @@ async def eliminar_cuenta(
 
     await crud.delete_user(db, usuario)
 
-    if refresh_token:
+    # v2.8 (recuperar datos): con "conservar Drive" NO se revoca el permiso de Google. La app
+    # usa el alcance drive.file, y Google quita el acceso a los archivos que la app creó en
+    # cuanto la persona des-autoriza la app: si se revocara acá, al volver a registrarse la
+    # app ya no podría ver la carpeta 'Docukids' vieja y no habría nada que recuperar. El
+    # token guardado se borra igual junto con el usuario, así que la app no puede actuar
+    # sobre ese Drive; la persona puede quitar el permiso cuando quiera desde su cuenta de
+    # Google. Con delete_drive=true la carpeta ya va a la papelera, así que sí se revoca.
+    if refresh_token and delete_drive:
         await revocar_permiso_de_google(refresh_token)
 
     await borrar_usuario_de_auth(user_id)
