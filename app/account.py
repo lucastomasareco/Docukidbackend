@@ -17,6 +17,7 @@ from uuid import UUID
 
 import httpx
 from fastapi import HTTPException, status
+from googleapiclient.errors import HttpError
 
 from .config import settings
 
@@ -29,6 +30,25 @@ def _url_base_supabase() -> str:
     """https://<proyecto>.supabase.co, sacada de SUPABASE_JWKS_URL (así no hace falta otra variable)."""
     partes = urlsplit(settings.supabase_jwks_url)
     return f"{partes.scheme}://{partes.netloc}"
+
+
+def motivo_de_error(error: Exception) -> str:
+    """
+    Texto corto y SIN datos privados de por qué falló algo con Google, para el log y para el aviso:
+    'Google HTTP 403 insufficientFilePermissions', 'Google HTTP 429 rateLimitExceeded' o, si no es
+    un error de la API de Google, solo el tipo ('timeout', 'OSError'...). Nunca incluye tokens.
+    """
+    if isinstance(error, HttpError):
+        estado = getattr(error.resp, "status", "?")
+        razon = ""
+        try:
+            detalles = getattr(error, "error_details", None) or []
+            if detalles and isinstance(detalles[0], dict):
+                razon = str(detalles[0].get("reason", ""))
+        except Exception:
+            razon = ""
+        return f"Google HTTP {estado} {razon}".strip()
+    return type(error).__name__
 
 
 async def revocar_permiso_de_google(refresh_token: str) -> None:
@@ -70,7 +90,7 @@ async def borrar_usuario_de_auth(user_id: UUID) -> None:
         logger.error("No se pudo contactar a Supabase Auth (%s).", type(error).__name__)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="No se pudo terminar de eliminar la cuenta. Probá de nuevo en un momento.",
+            detail=f"No se pudo terminar de eliminar la cuenta (no se pudo contactar a Supabase: {type(error).__name__}). Probá de nuevo en un momento.",
         )
 
     if respuesta.status_code in (200, 204, 404):
@@ -79,5 +99,5 @@ async def borrar_usuario_de_auth(user_id: UUID) -> None:
     logger.error("Supabase Auth rechazó el borrado del usuario (HTTP %s).", respuesta.status_code)
     raise HTTPException(
         status_code=status.HTTP_502_BAD_GATEWAY,
-        detail="No se pudo terminar de eliminar la cuenta. Probá de nuevo en un momento.",
+        detail=f"No se pudo terminar de eliminar la cuenta (Supabase respondió HTTP {respuesta.status_code}). Probá de nuevo en un momento.",
     )

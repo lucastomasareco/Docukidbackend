@@ -57,7 +57,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 from . import crud
-from .account import borrar_usuario_de_auth, revocar_permiso_de_google
+from .account import borrar_usuario_de_auth, motivo_de_error, revocar_permiso_de_google
 from .auth import get_current_user, get_data_owner
 from .config import settings
 from .calendar_sync import actualizar_evento, crear_evento, borrar_evento
@@ -1445,10 +1445,14 @@ async def eliminar_cuenta(
             except HTTPException:
                 raise
             except Exception as error:
-                logger.error("No se pudo mandar Docukids a la papelera de Drive (%s).", type(error).__name__)
+                motivo = motivo_de_error(error)
+                logger.error("No se pudo mandar Docukids a la papelera de Drive (%s).", motivo)
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail="No se pudieron mover tus archivos de Drive a la papelera. No se eliminó nada: probá de nuevo en un momento.",
+                    detail=(
+                        f"No se pudieron mover tus archivos de Drive a la papelera ({motivo}). "
+                        "No se eliminó nada. Probá de nuevo, o elegí «Conservarlos en mi Drive» para eliminar la cuenta igual."
+                    ),
                 )
 
     # Familias (v2.5, regla 6): si quien elimina es el TITULAR, se disuelve la
