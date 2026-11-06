@@ -384,6 +384,49 @@ async def set_child_folder_drive_id(
     await db.commit()
 
 
+async def get_documents_to_migrate(db: AsyncSession, user_id: UUID, limite: int) -> list:
+    """
+    Migración de Drive (paso 6): los próximos `limite` documentos de este usuario que
+    tienen archivo en Drive y todavía no se migraron, los de id más bajo primero.
+    Devuelve filas (Document, Child) para tener a mano los datos del hijo.
+    """
+    result = await db.execute(
+        select(Document, Child)
+        .join(Child, Document.child_id == Child.id)
+        .where(
+            Child.user_id == user_id,
+            Document.drive_file_id.is_not(None),
+            Document.drive_migrated.is_(False),
+        )
+        .order_by(Document.id)
+        .limit(limite)
+    )
+    return list(result.all())
+
+
+async def count_documents_to_migrate(db: AsyncSession, user_id: UUID) -> int:
+    """Cuántos documentos de este usuario faltan migrar (el `remaining` de POST /drive/migrate)."""
+    result = await db.execute(
+        select(func.count())
+        .select_from(Document)
+        .join(Child, Document.child_id == Child.id)
+        .where(
+            Child.user_id == user_id,
+            Document.drive_file_id.is_not(None),
+            Document.drive_migrated.is_(False),
+        )
+    )
+    return int(result.scalar_one())
+
+
+async def mark_document_migrated(db: AsyncSession, document: Document) -> None:
+    """Marca un documento como migrado (ya está en su lugar, o el archivo ya no existe)."""
+    if document.drive_migrated:
+        return
+    document.drive_migrated = True
+    await db.commit()
+
+
 async def get_documents_in_folder(db: AsyncSession, folder_id: int) -> Sequence[Document]:
     result = await db.execute(select(Document).where(Document.folder_id == folder_id))
     return result.scalars().all()

@@ -21,6 +21,7 @@ GET    /folders                -> lista las carpetas (crea las 3 de base la prim
 POST   /folders                -> crea una carpeta (también en Drive)
 PATCH  /folders/{id}           -> renombra una carpeta (también en Drive)
 DELETE /folders/{id}           -> borra una carpeta (sus archivos pasan a la raíz "Docukids")
+POST   /drive/migrate          -> migra de a 10 los documentos viejos a la carpeta de su hijo en Drive (v2.6)
 POST   /appointments           -> crea un turno médico (evento real en Google Calendar)
 PATCH  /appointments/{id}      -> edita un turno (y su evento en Google Calendar)
 DELETE /appointments/{id}      -> borra un turno (y su evento en Google Calendar)
@@ -63,12 +64,15 @@ from .database import get_db
 from .drive_upload import (
     EXTENSION_POR_MIME,
     PX_MINIATURA,
+    RESULTADO_NO_EXISTE,
     SinMiniatura,
+    abrir_drive,
     armar_nombre_archivo,
     borrar_carpeta_de_hijo_si_vacia,
     borrar_carpeta_si_vacia,
     borrar_subcarpeta_de_hijo,
     delete_file_from_drive,
+    migrar_archivo,
     mover_archivo_a_carpeta_de_hijo,
     nombre_carpeta_hijo,
     obtener_miniatura_de_drive,
@@ -105,12 +109,13 @@ from .schemas import (
     FoldersResponse,
     FolderUpdate,
     InviteResponse,
+    MigrateResponse,
     UploadResponse,
 )
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Docukids API", version="2.5.0")
+app = FastAPI(title="Docukids API", version="2.6.0")
 
 # La app móvil no corre en un navegador con las mismas reglas que una web,
 # pero dejamos CORS abierto para no tener sorpresas si en algún momento se
@@ -413,13 +418,9 @@ async def subir_documento(
     # Ahora que existe el ID del documento, el archivo en Drive lo lleva en el
     # nombre. Si falla NO se deshace nada: el archivo ya está en la carpeta del
     # hijo y su nombre lleva el ID del hijo.
-    try:
-        nombre_final = armar_nombre_archivo(hijo_id, hijo_nombre, name, documento.id, ext)
-        await run_in_threadpool(renombrar_archivo_en_drive, usuario, drive_file_id, nombre_final)
-    except Exception:
-        logger.warning("No se pudo poner el ID del documento %s en el nombre del archivo de Drive.", documento.id)
-
-    return UploadResponse(
+    # La respuesta se arma ANTES del renombrado: así nada de lo que pase después
+    # puede impedir devolverla (el documento ya está guardado).
+    respuesta = UploadResponse(
         status=crud.compute_status(documento.expiry_date, documento.no_expiry),
         expiry_date=documento.expiry_date,
         no_expiry=documento.no_expiry,
@@ -428,6 +429,20 @@ async def subir_documento(
         folder_id=documento.folder_id,
         mime_type=documento.mime_type,
     )
+    doc_id_nuevo = documento.id
+
+    # Si el renombrado sale bien, el documento ya está en su lugar y con su nombre
+    # definitivo: se marca como migrado. Si falla, queda pendiente y POST /drive/migrate
+    # lo arregla (Guía §13, regla 7).
+    try:
+        nombre_final = armar_nombre_archivo(hijo_id, hijo_nombre, name, doc_id_nuevo, ext)
+        renombrado = await run_in_threadpool(renombrar_archivo_en_drive, usuario, drive_file_id, nombre_final)
+        if renombrado:
+            await crud.mark_document_migrated(db, documento)
+    except Exception:
+        logger.warning("No se pudo poner el ID del documento %s en el nombre del archivo de Drive.", doc_id_nuevo)
+
+    return respuesta
 
 # ---------- /documents ----------
 @app.get("/documents/{child_id}", response_model=DocumentsResponse)
@@ -732,6 +747,80 @@ async def borrar_carpeta(
 
     await crud.delete_folder(db, carpeta)
     return DeleteResponse(message="Deleted")
+
+# ---------- /drive/migrate (Drive por hijo, v2.6, Guía §13 regla 7) ----------
+# Cuántos documentos viejos se procesan por llamada. Un lote chico evita que la
+# llamada pase del tiempo máximo de Render (cada documento es 1 o 2 pedidos a Drive).
+_LOTE_MIGRACION = 10
+
+
+async def _limpiar_carpetas_viejas(db: AsyncSession, usuario: User) -> None:
+    """
+    Cuando ya no queda nada por migrar: borra de Drive las carpetas de la estructura
+    anterior ("Docukids / Salud", guardadas en folders.drive_folder_id) SOLO si están
+    vacías, y las olvida en la base. Si la persona dejó algo adentro, se conservan y
+    se vuelven a revisar en la próxima llamada.
+    """
+    for carpeta in await crud.get_folders_by_user(db, usuario.id):
+        if not carpeta.drive_folder_id:
+            continue
+        ya_no_existe = await run_in_threadpool(borrar_carpeta_si_vacia, usuario, carpeta.drive_folder_id)
+        if ya_no_existe:
+            await crud.set_folder_drive_id(db, carpeta, None)
+
+
+@app.post("/drive/migrate", response_model=MigrateResponse)
+async def migrar_drive(
+    usuario: User = Depends(get_data_owner),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Mueve y renombra los documentos subidos antes de la v2.6 a la carpeta de su hijo,
+    de a lotes de 10. Se vuelve a llamar hasta que `remaining` sea 0. Es idempotente:
+    repetirlo no rompe nada. El documento NUNCA se borra: si su archivo ya no está en
+    Drive se cuenta en `skipped` y se da por revisado. Si Google falla (que no sea un
+    404) corta con error; lo ya migrado queda marcado y la próxima llamada sigue.
+    """
+    filas = await crud.get_documents_to_migrate(db, usuario.id, _LOTE_MIGRACION)
+    migrated = 0
+    skipped = 0
+
+    if filas:
+        carpetas = {c.id: c for c in await crud.get_folders_by_user(db, usuario.id)}
+        drive = await run_in_threadpool(abrir_drive, usuario)
+        for documento, hijo in filas:
+            carpeta = carpetas.get(documento.folder_id) if documento.folder_id is not None else None
+            sub_guardada = (
+                await crud.get_child_folder_drive_id(db, hijo.id, carpeta.id) if carpeta is not None else None
+            )
+            resultado, hijo_vigente, sub_vigente = await run_in_threadpool(
+                migrar_archivo,
+                drive,
+                documento.drive_file_id,
+                hijo.id,
+                hijo.name,
+                hijo.drive_folder_id,
+                carpeta.name if carpeta is not None else None,
+                sub_guardada,
+                documento.name,
+                documento.id,
+            )
+            if resultado == RESULTADO_NO_EXISTE:
+                skipped += 1
+            else:
+                migrated += 1
+                # Se guardan primero los ids de las carpetas y recién después se marca el
+                # documento: así, si algo falla, no se pierde la carpeta ya creada.
+                await crud.set_child_drive_folder_id(db, hijo, hijo_vigente)
+                if carpeta is not None and sub_vigente:
+                    await crud.set_child_folder_drive_id(db, hijo.id, carpeta.id, sub_vigente)
+            await crud.mark_document_migrated(db, documento)
+
+    remaining = await crud.count_documents_to_migrate(db, usuario.id)
+    if remaining == 0:
+        await _limpiar_carpetas_viejas(db, usuario)
+    return MigrateResponse(migrated=migrated, skipped=skipped, remaining=remaining)
+
 
 # ---------- /appointments ----------
 # Familias (v2.5): igual que en los grupos anteriores, `usuario` es el DUEÑO DE

@@ -15,6 +15,7 @@ for _k in ("DATABASE_URL", "SUPABASE_JWKS_URL", "STATE_SECRET", "CRON_SECRET",
         "SUPABASE_JWKS_URL": "https://example.invalid/.well-known/jwks.json",
     }.get(_k, "x"))
 
+import pytest
 from googleapiclient.errors import HttpError
 
 from app import drive_upload as du
@@ -88,6 +89,8 @@ def test_extensiones_por_tipo_real():
 class _Resp:
     def __init__(self, status):
         self.status = status
+        # Las versiones nuevas de googleapiclient leen resp.reason al armar un HttpError.
+        self.reason = "Error simulado"
 
 
 def _error(status):
@@ -131,7 +134,8 @@ class _Archivos:
             if fileId not in self.drive.items:
                 raise _error(404)
             f = self.drive.items[fileId]
-            return {"id": fileId, "trashed": f.get("trashed", False), "parents": f.get("parents", [])}
+            return {"id": fileId, "name": f.get("name"), "mimeType": f.get("mime"),
+                    "trashed": f.get("trashed", False), "parents": f.get("parents", [])}
         return _Ejecutable(run)
 
     def create(self, body, media_body=None, fields=None):
@@ -507,3 +511,139 @@ def test_borrar_carpeta_vieja_solo_si_esta_vacia(monkeypatch):
     assert du.borrar_carpeta_si_vacia(None, vieja) is False and vieja in drive.items
     vacia = du._crear_subcarpeta(drive, "Escuela")
     assert du.borrar_carpeta_si_vacia(None, vacia) is True and vacia not in drive.items
+
+
+# ---------------------------------------------------------------------------
+# Migración de documentos viejos (paso 6): migrar_archivo
+# ---------------------------------------------------------------------------
+
+def _archivo_viejo(drive, nombre, mime="application/pdf", padre=None):
+    """Crea un archivo como los de antes de la v2.6: suelto en 'Docukids', sin extensión ni ID."""
+    padre = padre or _raiz(drive)
+    nuevo = drive.files().create(
+        body={"name": nombre, "parents": [padre], "mimeType": mime}).execute()
+    return nuevo["id"]
+
+
+def _migrar(drive, archivo_id, hijo=(12, "Ana"), carpeta=None, doc=("DNI", 57),
+           hijo_drive=None, sub_drive=None):
+    return du.migrar_archivo(drive, archivo_id, hijo[0], hijo[1], hijo_drive,
+                             carpeta, sub_drive, doc[0], doc[1])
+
+
+def test_migra_un_archivo_suelto_a_la_carpeta_del_hijo():
+    drive = DriveFalso()
+    archivo = _archivo_viejo(drive, "Ana - DNI")
+    resultado, hijo_id, sub_id = _migrar(drive, archivo)
+    assert resultado == du.RESULTADO_MIGRADO
+    assert sub_id is None
+    assert drive.items[hijo_id]["name"] == "12_Ana"
+    assert drive.items[archivo]["parents"] == [hijo_id]
+    assert drive.items[archivo]["name"] == "12_Ana_DNI_57.pdf"
+
+
+def test_migra_un_archivo_con_carpeta_a_la_subcarpeta_del_hijo():
+    drive = DriveFalso()
+    salud_vieja = du._crear_carpeta_en(drive, "Salud", _raiz(drive))
+    archivo = _archivo_viejo(drive, "Ana - Cartilla", padre=salud_vieja)
+    resultado, hijo_id, sub_id = _migrar(drive, archivo, carpeta="Salud", doc=("Cartilla", 58))
+    assert resultado == du.RESULTADO_MIGRADO
+    assert drive.items[sub_id]["name"] == "Salud"
+    assert drive.items[sub_id]["parents"] == [hijo_id]
+    assert drive.items[archivo]["parents"] == [sub_id]          # sale de la carpeta vieja
+    assert drive.items[archivo]["name"] == "12_Ana_Cartilla_58.pdf"
+
+
+def test_la_extension_sale_del_tipo_que_informa_drive():
+    drive = DriveFalso()
+    foto = _archivo_viejo(drive, "Ana - Foto", mime="image/jpeg")
+    _migrar(drive, foto, doc=("Foto", 60))
+    assert drive.items[foto]["name"] == "12_Ana_Foto_60.jpg"
+
+
+def test_tipo_desconocido_migra_sin_extension():
+    drive = DriveFalso()
+    raro = _archivo_viejo(drive, "Ana - Raro", mime="application/x-raro")
+    resultado, _, _ = _migrar(drive, raro, doc=("Raro", 61))
+    assert resultado == du.RESULTADO_MIGRADO
+    assert drive.items[raro]["name"] == "12_Ana_Raro_61"
+
+
+def test_migrar_dos_veces_la_segunda_ya_estaba():
+    drive = DriveFalso()
+    archivo = _archivo_viejo(drive, "Ana - DNI")
+    _, hijo_id, _ = _migrar(drive, archivo)
+    antes = {k: dict(v) for k, v in drive.items.items()}
+    resultado, hijo_2, sub_2 = _migrar(drive, archivo, hijo_drive=hijo_id)
+    assert resultado == du.RESULTADO_YA_ESTABA
+    assert hijo_2 == hijo_id
+    assert drive.items == antes                                  # no se tocó nada
+
+
+def test_migrar_reutiliza_la_carpeta_del_hijo_y_no_crea_otra():
+    drive = DriveFalso()
+    a = _archivo_viejo(drive, "Ana - DNI")
+    b = _archivo_viejo(drive, "Ana - Partida")
+    _, hijo_id, _ = _migrar(drive, a)
+    _, hijo_2, _ = _migrar(drive, b, doc=("Partida", 58), hijo_drive=hijo_id)
+    assert hijo_2 == hijo_id
+    assert sum(1 for f in drive.items.values() if f["name"] == "12_Ana") == 1
+
+
+def test_archivo_que_no_existe_se_salta_sin_crear_carpetas():
+    drive = DriveFalso()
+    _raiz(drive)
+    antes = {k: dict(v) for k, v in drive.items.items()}
+    resultado, hijo_id, sub_id = _migrar(drive, "no-existe", hijo_drive="h", sub_drive="s",
+                                         carpeta="Salud")
+    assert resultado == du.RESULTADO_NO_EXISTE
+    assert (hijo_id, sub_id) == ("h", "s")                       # devuelve los ids tal como llegaron
+    assert drive.items == antes                                  # ni carpetas nuevas ni cambios
+
+
+def test_archivo_en_la_papelera_se_salta():
+    drive = DriveFalso()
+    archivo = _archivo_viejo(drive, "Ana - DNI")
+    drive.items[archivo]["trashed"] = True
+    resultado, _, _ = _migrar(drive, archivo)
+    assert resultado == du.RESULTADO_NO_EXISTE
+    assert drive.items[archivo]["name"] == "Ana - DNI"           # intacto
+
+
+def test_dos_hijos_con_el_mismo_nombre_no_se_mezclan_al_migrar():
+    drive = DriveFalso()
+    dni_a = _archivo_viejo(drive, "Ana - DNI")
+    dni_b = _archivo_viejo(drive, "Ana - DNI")
+    _, carpeta_a, _ = _migrar(drive, dni_a, hijo=(12, "Ana"), doc=("DNI", 57))
+    _, carpeta_b, _ = _migrar(drive, dni_b, hijo=(13, "Ana"), doc=("DNI", 58))
+    assert carpeta_a != carpeta_b
+    assert drive.items[dni_a]["parents"] == [carpeta_a]
+    assert drive.items[dni_b]["parents"] == [carpeta_b]
+    assert drive.items[dni_a]["name"] == "12_Ana_DNI_57.pdf"
+    assert drive.items[dni_b]["name"] == "13_Ana_DNI_58.pdf"
+
+
+def test_si_la_carpeta_guardada_del_hijo_ya_no_existe_se_crea_otra():
+    drive = DriveFalso()
+    archivo = _archivo_viejo(drive, "Ana - DNI")
+    resultado, hijo_id, _ = _migrar(drive, archivo, hijo_drive="borrada")
+    assert resultado == du.RESULTADO_MIGRADO
+    assert hijo_id != "borrada"
+    assert drive.items[archivo]["parents"] == [hijo_id]
+
+
+def test_error_de_google_distinto_de_404_se_propaga(monkeypatch):
+    drive = DriveFalso()
+    archivo = _archivo_viejo(drive, "Ana - DNI")
+    original = _Archivos.update
+
+    def falla(self, *a, **k):
+        def run():
+            raise _error(500)
+        return _Ejecutable(run)
+
+    monkeypatch.setattr(_Archivos, "update", falla)
+    with pytest.raises(HttpError):
+        _migrar(drive, archivo)
+    monkeypatch.setattr(_Archivos, "update", original)
+    assert drive.items[archivo]["name"] == "Ana - DNI"           # nada quedó a medias

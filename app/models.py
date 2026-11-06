@@ -148,6 +148,14 @@ class Document(Base):
     #   supabase/migrations/add_documents_mime_type.sql
     mime_type = Column(Text, nullable=True)
 
+    # Drive por hijo (v2.6, paso 6). true = el archivo ya está en la carpeta de su
+    # hijo y con su nombre nuevo (o ya no existe en Drive). false = falta migrarlo
+    # con POST /drive/migrate. Los documentos que ya existían quedan en false.
+    #
+    # ⚠️ Antes de usarla hay que correr en el Editor SQL de Supabase:
+    #   supabase/migrations/add_documents_drive_migrated.sql
+    drive_migrated = Column(Boolean, nullable=False, server_default=text("false"))
+
     # NOTA: adrede NO hay columna "status". Se calcula al vuelo en crud.py
     # comparando expiry_date con la fecha de hoy (ver sección 3 de la Guía Técnica).
 

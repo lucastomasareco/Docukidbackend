@@ -549,6 +549,99 @@ def borrar_carpeta_si_vacia(user: User, drive_folder_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Migración de documentos viejos (v2.6, paso 6): POST /drive/migrate
+# ---------------------------------------------------------------------------
+# Los documentos subidos ANTES de la v2.6 están en "Docukids / {Carpeta}" (o sueltos
+# en "Docukids") y se llaman "{hijo} - {doc}", sin extensión ni ID. migrar_archivo
+# arregla UN archivo: lo deja en "Docukids / {IDhijo}_{Nombre} / {Carpeta}" con el
+# nombre "{IDhijo}_{Nombre}_{Doc}_{IDdoc}.{ext}". Los lotes los arma main.py.
+
+RESULTADO_MIGRADO = "migrado"      # se movió y/o se renombró
+RESULTADO_YA_ESTABA = "ya_estaba"  # ya estaba en su lugar y con su nombre: no se tocó
+RESULTADO_NO_EXISTE = "no_existe"  # el archivo ya no está en Drive (o está en la papelera)
+
+
+@traducir_permisos_de_google("Google Drive")
+def abrir_drive(user: User):
+    """
+    Abre el cliente de Drive UNA vez, para reutilizarlo en todo un lote de migración
+    (armar las credenciales en cada documento sería lento).
+    """
+    return _drive(user)
+
+
+@traducir_permisos_de_google("Google Drive")
+def migrar_archivo(
+    drive_service,
+    drive_file_id: str,
+    child_id: int,
+    child_name: str,
+    child_drive_folder_id: Optional[str],
+    folder_name: Optional[str],
+    child_folder_drive_id: Optional[str],
+    doc_name: str,
+    doc_id: int,
+) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    Deja UN archivo viejo en la carpeta de su hijo y con su nombre nuevo.
+
+    Hace una consulta a Drive (dónde está, cómo se llama, qué tipo es) y, solo si
+    hace falta, UNA actualización que lo mueve y lo renombra a la vez. La extensión
+    sale del tipo que informa Drive (sirve también para documentos sin mime_type).
+
+    Devuelve (resultado, id_carpeta_hijo_vigente, id_subcarpeta_vigente_o_None):
+      - "migrado":   se movió y/o se renombró.
+      - "ya_estaba": ya estaba bien; no se tocó nada.
+      - "no_existe": el archivo no está en Drive o está en la papelera. En ese caso
+                     NO se crea ninguna carpeta y se devuelven los ids tal como
+                     llegaron. El documento nunca se borra: solo se da por revisado.
+    El llamador guarda los ids vigentes que hayan cambiado (igual que en /upload).
+    Un error de Google que no sea 404 se propaga: se vuelve a llamar y sigue.
+    """
+    try:
+        archivo = drive_service.files().get(
+            fileId=drive_file_id, fields="id, name, mimeType, parents, trashed"
+        ).execute()
+    except HttpError as error:
+        if _status(error) == 404:
+            logger.info("Archivo %s ya no existe en Drive; se salta.", drive_file_id)
+            return RESULTADO_NO_EXISTE, child_drive_folder_id, child_folder_drive_id
+        raise
+    if archivo.get("trashed", False):
+        logger.info("Archivo %s está en la papelera; se salta.", drive_file_id)
+        return RESULTADO_NO_EXISTE, child_drive_folder_id, child_folder_drive_id
+
+    hijo_id = _asegurar_carpeta_hijo(drive_service, child_id, child_name, child_drive_folder_id)
+    destino_id = hijo_id
+    sub_id = None
+    if folder_name is not None:
+        sub_id = _asegurar_subcarpeta_de_hijo(drive_service, hijo_id, folder_name, child_folder_drive_id)
+        destino_id = sub_id
+
+    ext = EXTENSION_POR_MIME.get(archivo.get("mimeType") or "")
+    nombre_nuevo = armar_nombre_archivo(child_id, child_name, doc_name, doc_id, ext)
+
+    padres_actuales = archivo.get("parents") or []
+    ya_en_su_carpeta = padres_actuales == [destino_id]
+    if ya_en_su_carpeta and archivo.get("name") == nombre_nuevo:
+        return RESULTADO_YA_ESTABA, hijo_id, sub_id
+
+    cambios = {"fileId": drive_file_id, "body": {"name": nombre_nuevo}, "fields": "id"}
+    if not ya_en_su_carpeta:
+        cambios["addParents"] = destino_id
+        sobran = [p for p in padres_actuales if p != destino_id]
+        if sobran:
+            cambios["removeParents"] = ",".join(sobran)
+    try:
+        drive_service.files().update(**cambios).execute()
+    except HttpError as error:
+        if _status(error) == 404:  # lo borraron justo ahora
+            return RESULTADO_NO_EXISTE, child_drive_folder_id, child_folder_drive_id
+        raise
+    return RESULTADO_MIGRADO, hijo_id, sub_id
+
+
+# ---------------------------------------------------------------------------
 # Miniaturas (v2.4): GET /documents/{doc_id}/thumbnail
 # ---------------------------------------------------------------------------
 # Drive genera miniaturas de fotos y de PDF (primera página). El enlace
