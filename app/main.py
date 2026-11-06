@@ -1442,7 +1442,22 @@ async def eliminar_cuenta(
         if not es_miembro:
             try:
                 await run_in_threadpool(enviar_docukids_a_papelera, usuario)
-            except HTTPException:
+            except HTTPException as error_http:
+                # 401 = Google ya no deja renovar el acceso (permiso revocado, token vencido, app en
+                # modo "Testing"...). Si se dejara pasar como 401, la app diría "Google desconectado
+                # -> Ir a Ajustes" y la persona no podría eliminar su cuenta. Se traduce a un aviso
+                # que explica la causa y ofrece la salida. No se borra nada.
+                if error_http.status_code == 401:
+                    logger.error("No se pudo mandar Docukids a la papelera: Google no renovó el acceso (401).")
+                    raise HTTPException(
+                        status_code=status.HTTP_502_BAD_GATEWAY,
+                        detail=(
+                            "Google ya no nos deja acceder a tu Drive (el permiso venció o fue quitado), "
+                            "así que no se pudo mover tu carpeta a la papelera. No se eliminó nada. "
+                            "Elegí «Conservarlos en mi Drive» para eliminar la cuenta igual: tus archivos "
+                            "quedan en tu Drive y podés borrarlos a mano."
+                        ),
+                    )
                 raise
             except Exception as error:
                 motivo = motivo_de_error(error)
