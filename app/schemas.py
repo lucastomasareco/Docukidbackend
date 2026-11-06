@@ -15,7 +15,7 @@ from datetime import time as dt_time
 from typing import List, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # ---------- Hijos (children) ----------
@@ -193,6 +193,39 @@ class MigrateResponse(BaseModel):
       - remaining: documentos que todavía faltan.
     """
     migrated: int
+    skipped: int
+    remaining: int
+
+
+# ---------- Recuperar datos tras re-registro (v2.8) ----------
+
+class RecoverCandidate(BaseModel):
+    """Una carpeta de hijo que quedó en Drive y todavía no está vinculada a ningún hijo."""
+    drive_folder_id: str
+    name: str
+    old_child_id: int
+    documents: int
+    folders: List[str]
+
+
+class RecoverPreviewResponse(BaseModel):
+    candidates: List[RecoverCandidate]
+
+
+class RecoverRequest(BaseModel):
+    # Solo se reciben ids de carpetas; los archivos se vuelven a leer de Drive en el servidor.
+    folders: List[str] = Field(min_length=1, max_length=20)
+
+
+class RecoverResponse(BaseModel):
+    """
+    - recovered: hijos recuperados (con su carpeta vieja ya vinculada, sin duplicar).
+    - documents: documentos reconectados.
+    - skipped:   ids pedidos que ya no existen o ya estaban vinculados (no es error).
+    - remaining: documentos por renombrar; llamar a POST /drive/migrate hasta que sea 0.
+    """
+    recovered: List[ChildOut]
+    documents: int
     skipped: int
     remaining: int
 

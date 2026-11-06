@@ -341,6 +341,16 @@ async def set_child_drive_folder_id(db: AsyncSession, hijo: Child, drive_folder_
     await db.refresh(hijo)
 
 
+async def get_linked_child_drive_folder_ids(db: AsyncSession, user_id: UUID) -> list:
+    """Ids de Drive de las carpetas de hijo ya vinculadas a algún hijo de este usuario."""
+    result = await db.execute(
+        select(Child.drive_folder_id).where(
+            Child.user_id == user_id, Child.drive_folder_id.is_not(None)
+        )
+    )
+    return [r for r in result.scalars().all()]
+
+
 async def get_child_folder_drive_id(db: AsyncSession, child_id: int, folder_id: int) -> Optional[str]:
     """Id en Drive de la subcarpeta `folder_id` DE ESTE HIJO (None = todavía no creada)."""
     result = await db.execute(
