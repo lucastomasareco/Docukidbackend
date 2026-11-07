@@ -48,8 +48,14 @@ async def get_children_by_user(db: AsyncSession, user_id: UUID) -> Sequence[Chil
     return result.scalars().all()
 
 
-async def create_child(db: AsyncSession, user_id: UUID, name: str, birth_date: Optional[date]) -> Child:
-    child = Child(user_id=user_id, name=name, birth_date=birth_date)
+async def create_child(
+    db: AsyncSession,
+    user_id: UUID,
+    name: str,
+    birth_date: Optional[date],
+    avatar_url: Optional[str] = None,
+) -> Child:
+    child = Child(user_id=user_id, name=name, birth_date=birth_date, avatar_url=avatar_url)
     db.add(child)
     await db.commit()
     await db.refresh(child)
@@ -71,13 +77,15 @@ async def get_child_owned_by_user(db: AsyncSession, child_id: int, user_id: UUID
 async def update_child(db: AsyncSession, child: Child, cambios: dict) -> Child:
     """
     Edita un hijo ya validado como propio del usuario (ver get_child_owned_by_user).
-    `cambios` trae SOLO los campos que la persona mandó (name y/o birth_date);
-    birth_date puede venir como None para borrarla.
+    `cambios` trae SOLO los campos que la persona mandó (name, birth_date y/o
+    avatar_url); birth_date y avatar_url pueden venir como None para borrarlos.
     """
     if "name" in cambios:
         child.name = cambios["name"].strip()
     if "birth_date" in cambios:
         child.birth_date = cambios["birth_date"]
+    if "avatar_url" in cambios:
+        child.avatar_url = cambios["avatar_url"]
     await db.commit()
     await db.refresh(child)
     return child

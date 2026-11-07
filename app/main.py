@@ -178,7 +178,9 @@ async def crear_hijo(
     usuario: User = Depends(get_data_owner),
     db: AsyncSession = Depends(get_db),
 ):
-    hijo = await crud.create_child(db, usuario.id, datos.name, datos.birth_date)
+    hijo = await crud.create_child(
+        db, usuario.id, datos.name, datos.birth_date, avatar_url=datos.avatar_url
+    )
     return ChildResponse(child=ChildOut.model_validate(hijo))
 
 @app.put("/children/{child_id}", response_model=ChildResponse)

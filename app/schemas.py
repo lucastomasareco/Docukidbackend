@@ -15,14 +15,40 @@ from datetime import time as dt_time
 from typing import List, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+import re
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # ---------- Hijos (children) ----------
 
+# Foto de perfil (issue #36). La app la reduce a ~256 px y la manda como texto
+# ("data URI") dentro del mismo pedido que crea/edita al hijo: no hay subida aparte
+# ni almacenamiento nuevo. Tope de 150.000 caracteres (~110 KB de imagen): la foto
+# real pesa ~15-30 KB, así que sobra margen y la base no se llena de archivos grandes.
+AVATAR_MAX_CARACTERES = 150_000
+_AVATAR_PATRON = re.compile(r"^data:image/(jpeg|png|webp);base64,[A-Za-z0-9+/]+={0,2}$")
+
+
+def _validar_avatar(valor: Optional[str]) -> Optional[str]:
+    if valor is None:
+        return None
+    if len(valor) > AVATAR_MAX_CARACTERES:
+        raise ValueError("La foto es demasiado pesada.")
+    if not _AVATAR_PATRON.match(valor):
+        raise ValueError("La foto debe ser una imagen JPEG, PNG o WEBP en base64.")
+    return valor
+
+
 class ChildCreate(BaseModel):
     name: str
     birth_date: Optional[date] = None
+    avatar_url: Optional[str] = None
+
+    @field_validator("avatar_url")
+    @classmethod
+    def _avatar_valido(cls, v):
+        return _validar_avatar(v)
 
 
 class ChildUpdate(BaseModel):
@@ -31,17 +57,24 @@ class ChildUpdate(BaseModel):
     Se manda SOLO lo que cambia; lo que no se manda, queda como estaba.
       - name: no puede ser vacío ni null.
       - birth_date: "AAAA-MM-DD" para fijarla; null para borrarla.
+      - avatar_url: foto como data URI (ver ChildCreate); null para quitarla.
     Un cuerpo vacío ({}) se rechaza con 422.
     Compatible con la app actual, que manda solo { name }.
     """
     name: Optional[str] = None
     birth_date: Optional[date] = None
+    avatar_url: Optional[str] = None
+
+    @field_validator("avatar_url")
+    @classmethod
+    def _avatar_valido(cls, v):
+        return _validar_avatar(v)
 
     @model_validator(mode="after")
     def _validar_cambios(self):
         enviados = self.model_fields_set
         if not enviados:
-            raise ValueError("Mandá al menos un campo para cambiar (name o birth_date).")
+            raise ValueError("Mandá al menos un campo para cambiar (name, birth_date o avatar_url).")
         if "name" in enviados and (self.name is None or not self.name.strip()):
             raise ValueError("El nombre no puede estar vacío.")
         return self
@@ -53,6 +86,7 @@ class ChildOut(BaseModel):
     id: int
     name: str
     birth_date: Optional[date] = None
+    avatar_url: Optional[str] = None
 
 
 class ChildrenResponse(BaseModel):
