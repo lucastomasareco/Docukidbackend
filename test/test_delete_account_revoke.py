@@ -17,7 +17,7 @@ for _k in ("DATABASE_URL", "SUPABASE_JWKS_URL", "STATE_SECRET", "CRON_SECRET",
 from app import main
 
 
-def _correr(monkeypatch, delete_drive):
+def _correr(monkeypatch, delete_drive, sin_mover=0):
     anotado = {"revocados": [], "papelera": 0, "usuario_borrado": False, "auth_borrado": False}
 
     async def delete_user(db, u):
@@ -31,7 +31,7 @@ def _correr(monkeypatch, delete_drive):
 
     def papelera(u):
         anotado["papelera"] += 1
-        return 1
+        return sin_mover  # cuántos elementos de Drive quedaron sin mover a la papelera
 
     monkeypatch.setattr(main.settings, "supabase_secret_key", "sb_secret_x", raising=False)
     monkeypatch.setattr(main.crud, "delete_user", delete_user)
@@ -40,7 +40,8 @@ def _correr(monkeypatch, delete_drive):
     monkeypatch.setattr(main, "enviar_docukids_a_papelera", papelera)
 
     usuario = SimpleNamespace(id="u1", google_refresh_token="TOKEN", family_id=None)
-    asyncio.run(main.eliminar_cuenta(delete_drive=delete_drive, usuario=usuario, db=None))
+    respuesta = asyncio.run(main.eliminar_cuenta(delete_drive=delete_drive, usuario=usuario, db=None))
+    anotado["mensaje"] = respuesta.message
     return anotado
 
 
@@ -87,3 +88,16 @@ def test_papelera_con_google_desconectado_da_aviso_claro_y_no_borra_nada(monkeyp
     assert "Conservarlos en mi Drive" in e.value.detail     # trae la salida
     assert "renovar el acceso" not in e.value.detail        # no se confunde con "Google desconectado"
     assert not anotado["usuario_borrado"] and not anotado["auth_borrado"]   # no se borró nada
+
+
+
+def test_papelera_con_archivos_ajenos_elimina_igual_y_avisa_que_fue_parcial(monkeypatch):
+    # Google 403 appNotAuthorizedToChild: lo que la app puede tocar va a la papelera, lo demás
+    # se queda, y la cuenta se elimina igual. La app tiene que enterarse (mensaje distinto).
+    r = _correr(monkeypatch, delete_drive=True, sin_mover=2)
+    assert r["usuario_borrado"] and r["auth_borrado"]
+    assert r["mensaje"] == "DeletedPartial"
+
+
+def test_papelera_completa_responde_deleted(monkeypatch):
+    assert _correr(monkeypatch, delete_drive=True, sin_mover=0)["mensaje"] == "Deleted"

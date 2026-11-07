@@ -183,6 +183,30 @@ class DeleteResponse(BaseModel):
     message: str
 
 
+class TrashedDocumentOut(BaseModel):
+    """Un documento que la persona borró y todavía se puede restaurar desde la papelera de Drive."""
+    drive_file_id: str
+    name: str
+    type: Optional[str] = None
+    child_id: int
+    child_name: str
+    folder_id: Optional[int] = None
+    expiry_date: Optional[date] = None
+    no_expiry: bool = False
+    mime_type: Optional[str] = None
+    days_left: int  # días que le quedan en la papelera de Drive (máx. 30)
+
+
+class TrashedDocumentsResponse(BaseModel):
+    documents: List[TrashedDocumentOut]
+
+
+class RestoreDocumentResponse(BaseModel):
+    doc_id: int
+    child_id: int
+    name: str
+
+
 class MigrateResponse(BaseModel):
     """
     Respuesta de POST /drive/migrate (Drive por hijo, v2.6). Se vuelve a llamar

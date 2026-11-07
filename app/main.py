@@ -45,7 +45,7 @@ probar todo de punta a punta -- ya no es código nuevo del backend.
 import logging
 import re
 import unicodedata
-from datetime import timezone
+from datetime import date, timezone
 from typing import Literal, Optional
 from uuid import UUID
 import requests
@@ -63,6 +63,14 @@ from .config import settings
 from .calendar_sync import actualizar_evento, crear_evento, borrar_evento
 from .database import get_db
 from .drive_recover import escanear_carpetas_recuperables, restaurar_carpeta_de_papelera
+from .drive_trash import (
+    NoRestaurable,
+    listar_documentos_en_papelera,
+    leer_documento_de_papelera,
+    mandar_documento_a_papelera,
+    propiedades_de_documento,
+    restaurar_documento_en_drive,
+)
 from .drive_upload import (
     EXTENSION_POR_MIME,
     PX_MINIATURA,
@@ -118,6 +126,9 @@ from .schemas import (
     RecoverPreviewResponse,
     RecoverRequest,
     RecoverResponse,
+    RestoreDocumentResponse,
+    TrashedDocumentOut,
+    TrashedDocumentsResponse,
     UploadResponse,
 )
 
@@ -624,10 +635,190 @@ async def borrar_documento(
     
     # Borramos primero de Drive (best-effort: si falla, igual seguimos y
     # borramos el registro de la base -- ver nota en drive_upload.py).
+    # v3.0: el archivo ya NO se elimina para siempre: va a la papelera de Drive (30 días) llevando
+    # consigo los datos que solo viven en la base (tipo, vencimiento, carpeta), para poder
+    # restaurarlo desde GET/POST /trash/documents.
+    en_papelera = False
     if documento.drive_file_id:
-        await run_in_threadpool(delete_file_from_drive, usuario, documento.drive_file_id)
+        en_papelera = await run_in_threadpool(
+            mandar_documento_a_papelera,
+            usuario,
+            documento.drive_file_id,
+            propiedades_de_documento(documento),
+        )
     await crud.delete_document(db, documento)
-    return DeleteResponse(message="Deleted")
+    return DeleteResponse(message="DeletedToTrash" if en_papelera else "Deleted")
+
+
+# ---------- /trash/documents (v3.0) ----------
+# Rutas aparte de /documents/{child_id} para que "trash" nunca se confunda con un child_id.
+@app.get("/trash/documents", response_model=TrashedDocumentsResponse)
+async def listar_documentos_borrados(
+    usuario: User = Depends(get_data_owner),
+    db: AsyncSession = Depends(get_db),
+):
+    """Documentos borrados que todavía están en la papelera de Drive (máx. 30 días)."""
+    if not usuario.google_refresh_token:
+        return TrashedDocumentsResponse(documents=[])
+    try:
+        archivos = await run_in_threadpool(listar_documentos_en_papelera, usuario)
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.error("No se pudo leer la papelera de Drive: %s", motivo_de_error(error))
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="No se pudo leer la papelera de Drive. Probá de nuevo en unos segundos.",
+        )
+
+    hijos = {h.id: h.name for h in await crud.get_children_by_user(db, usuario.id)}
+    salida = []
+    for a in archivos:
+        props = a["props"]
+        try:
+            hijo_id = int(props.get("dk_child", ""))
+        except ValueError:
+            continue
+        if hijo_id not in hijos:
+            continue  # el hijo ya no existe (o no es de esta persona): no hay dónde restaurarlo
+        try:
+            carpeta_id = int(props["dk_folder"]) if props.get("dk_folder") else None
+        except ValueError:
+            carpeta_id = None
+        try:
+            vence = date.fromisoformat(props["dk_exp"]) if props.get("dk_exp") else None
+        except ValueError:
+            vence = None
+        salida.append(
+            TrashedDocumentOut(
+                drive_file_id=a["drive_file_id"],
+                name=props.get("dk_name") or a["name"],
+                type=props.get("dk_type") or None,
+                child_id=hijo_id,
+                child_name=hijos[hijo_id],
+                folder_id=carpeta_id,
+                expiry_date=vence,
+                no_expiry=props.get("dk_noexp") == "1",
+                mime_type=a["mime_type"],
+                days_left=a["days_left"],
+            )
+        )
+    salida.sort(key=lambda d: d.days_left)  # los que están por vencer en la papelera, primero
+    return TrashedDocumentsResponse(documents=salida)
+
+
+@app.post("/trash/documents/{drive_file_id}/restore", response_model=RestoreDocumentResponse)
+async def restaurar_documento_borrado(
+    drive_file_id: str,
+    usuario: User = Depends(get_data_owner),
+    db: AsyncSession = Depends(get_db),
+):
+    """Saca un documento de la papelera de Drive y vuelve a crearlo con sus datos."""
+    no_esta = HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Ese documento ya no está en la papelera de Drive (pasaron más de 30 días o se vació).",
+    )
+    try:
+        archivo = await run_in_threadpool(leer_documento_de_papelera, usuario, drive_file_id)
+    except NoRestaurable:
+        raise no_esta
+
+    props = archivo.get("appProperties") or {}
+    try:
+        hijo_id_pedido = int(props.get("dk_child", ""))
+    except ValueError:
+        raise no_esta
+    hijo = await crud.get_child_owned_by_user(db, hijo_id_pedido, usuario.id)
+    if hijo is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="El hijo de este documento ya no existe, así que no se puede restaurar.",
+        )
+    # Si la carpeta (Salud, Escuela...) ya no existe, el documento vuelve suelto, como pasa en la base.
+    carpeta = None
+    try:
+        if props.get("dk_folder"):
+            carpeta = await crud.get_folder_owned_by_user(db, int(props["dk_folder"]), usuario.id)
+    except ValueError:
+        carpeta = None
+    try:
+        vence = date.fromisoformat(props["dk_exp"]) if props.get("dk_exp") else None
+    except ValueError:
+        vence = None
+    sin_vencimiento = props.get("dk_noexp") == "1"
+
+    # Guardamos ya lo que hace falta: tras un rollback SQLAlchemy "olvida" los objetos cargados.
+    hijo_id, hijo_nombre, hijo_drive = hijo.id, hijo.name, hijo.drive_folder_id
+    carpeta_id = carpeta.id if carpeta is not None else None
+    carpeta_nombre = carpeta.name if carpeta is not None else None
+    nombre = props.get("dk_name") or archivo.get("name") or "documento"
+    tipo = props.get("dk_type") or None
+    sub_guardada = await crud.get_child_folder_drive_id(db, hijo_id, carpeta_id) if carpeta_id is not None else None
+
+    try:
+        resultado = await run_in_threadpool(
+            restaurar_documento_en_drive,
+            usuario, archivo, hijo_id, hijo_nombre, hijo_drive, carpeta_nombre, sub_guardada,
+        )
+    except NoRestaurable:
+        raise no_esta
+
+    try:
+        await crud.set_child_drive_folder_id(db, hijo, resultado["hijo_vigente"])
+        if carpeta_id is not None and resultado["sub_vigente"]:
+            await crud.set_child_folder_drive_id(db, hijo_id, carpeta_id, resultado["sub_vigente"])
+    except Exception:
+        logger.warning("No se pudo guardar el id de Drive de la carpeta del hijo %s.", hijo_id)
+        await db.rollback()
+        try:
+            await db.refresh(usuario)
+        except Exception:
+            pass
+
+    try:
+        documento = await crud.create_document(
+            db,
+            child_id=hijo_id,
+            name=nombre,
+            type_=tipo,
+            drive_file_id=drive_file_id,
+            drive_link=resultado["drive_link"],
+            expiry_date=vence,
+            folder_id=carpeta_id,
+            mime_type=resultado["mime_type"],
+        )
+        if sin_vencimiento:
+            documento = await crud.update_document_expiry(db, documento, None, True)
+    except Exception:
+        logger.exception("Falló el INSERT del documento restaurado; se vuelve a mandar su archivo a la papelera.")
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        try:
+            await run_in_threadpool(mandar_documento_a_papelera, usuario, drive_file_id, props)
+        except Exception:
+            logger.error("Archivo restaurado sin registro en la base (no se pudo devolver a la papelera): %s", drive_file_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="No se pudo restaurar el documento. Sigue en la papelera de Drive; probá de nuevo.",
+        )
+
+    respuesta = RestoreDocumentResponse(doc_id=documento.id, child_id=hijo_id, name=documento.name)
+    doc_id_nuevo = documento.id
+
+    # El nombre del archivo lleva el ID del documento, que ahora es uno nuevo. Mejor esfuerzo:
+    # si falla no pasa nada grave (POST /drive/migrate lo corrige) y la respuesta ya está armada.
+    try:
+        ext = EXTENSION_POR_MIME.get(resultado["mime_type"] or "")
+        nombre_final = armar_nombre_archivo(hijo_id, hijo_nombre, nombre, doc_id_nuevo, ext)
+        renombrado = await run_in_threadpool(renombrar_archivo_en_drive, usuario, drive_file_id, nombre_final)
+        if renombrado:
+            await crud.mark_document_migrated(db, documento)
+    except Exception:
+        logger.warning("No se pudo renombrar el archivo restaurado del documento %s.", doc_id_nuevo)
+
+    return respuesta
 
 # ---------- /folders ----------
 # Familias (v2.5): igual que en /children y /documents, `usuario` es el DUEÑO DE
@@ -1430,6 +1621,7 @@ async def eliminar_cuenta(
 
     user_id = usuario.id
     refresh_token = usuario.google_refresh_token
+    sin_mover_en_drive = 0  # elementos de Drive que la app no pudo mandar a la papelera
 
     # Drive (v2.7, Guía §14): se hace PRIMERO, antes de tocar la base y de revocar el
     # permiso de Google (después ya no habría token ni se sabría de quién es la carpeta).
@@ -1441,7 +1633,7 @@ async def eliminar_cuenta(
             es_miembro = familia_drive is not None and familia_drive.owner_id != usuario.id
         if not es_miembro:
             try:
-                await run_in_threadpool(enviar_docukids_a_papelera, usuario)
+                sin_mover_en_drive = await run_in_threadpool(enviar_docukids_a_papelera, usuario)
             except HTTPException as error_http:
                 # 401 = Google ya no deja renovar el acceso (permiso revocado, token vencido, app en
                 # modo "Testing"...). Si se dejara pasar como 401, la app diría "Google desconectado
@@ -1493,4 +1685,7 @@ async def eliminar_cuenta(
     # El token guardado se borró junto con el usuario: la app no puede actuar sobre ese Drive.
 
     await borrar_usuario_de_auth(user_id)
+    if sin_mover_en_drive:
+        logger.warning("Cuenta eliminada; %s elemento(s) de Drive quedaron sin mover a la papelera (sin permiso).", sin_mover_en_drive)
+        return DeleteResponse(message="DeletedPartial")
     return DeleteResponse(message="Deleted")

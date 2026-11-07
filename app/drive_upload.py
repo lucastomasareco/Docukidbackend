@@ -661,28 +661,96 @@ def _buscar_carpetas_raiz(drive_service, en_papelera: bool = False) -> List[str]
     return [f["id"] for f in resultado.get("files", [])]
 
 
+def _es_app_no_autorizada_a_hijo(error: HttpError) -> bool:
+    """
+    403 appNotAuthorizedToChild: con el permiso drive.file la app solo puede modificar lo que ella
+    creó. Si la carpeta tiene adentro algo que la app no puede tocar (un archivo puesto a mano,
+    por otra app, o de cuando el permiso estaba otorgado de otra forma), Drive no deja mandar
+    la carpeta entera a la papelera.
+    """
+    return _status(error) == 403 and "appnotauthorizedtochild" in str(error).lower()
+
+
+def _a_papelera_lo_que_se_pueda(drive_service, carpeta_id: str) -> int:
+    """
+    Intenta mandar la carpeta (con todo lo de adentro) a la papelera. Si Drive dice
+    appNotAuthorizedToChild, manda uno por uno lo que la app SÍ puede tocar y deja lo demás.
+    Devuelve cuántos elementos quedaron SIN mover (0 = todo fue a la papelera).
+    Cualquier otro error (red, 429, 5xx...) se propaga: el llamador no borra nada.
+    """
+    try:
+        drive_service.files().update(fileId=carpeta_id, body={"trashed": True}, fields="id").execute()
+        return 0
+    except HttpError as error:
+        if _status(error) == 404:
+            return 0
+        if not _es_app_no_autorizada_a_hijo(error):
+            raise
+
+    # Hay algo adentro que la app no puede tocar. Con drive.file, files.list solo devuelve lo
+    # que la app sí puede ver, y eso es justo lo que sí puede mover.
+    hijos = []
+    pagina = None
+    while True:
+        respuesta = drive_service.files().list(
+            q=f"'{carpeta_id}' in parents and trashed=false",
+            spaces="drive",
+            fields="nextPageToken, files(id, mimeType)",
+            pageSize=1000,
+            pageToken=pagina,
+        ).execute()
+        hijos.extend(respuesta.get("files", []))
+        pagina = respuesta.get("nextPageToken")
+        if not pagina:
+            break
+
+    omitidas = 0
+    for hijo in hijos:
+        if hijo.get("mimeType") == _MIME_CARPETA:
+            omitidas += _a_papelera_lo_que_se_pueda(drive_service, hijo["id"])
+            continue
+        try:
+            drive_service.files().update(fileId=hijo["id"], body={"trashed": True}, fields="id").execute()
+        except HttpError as error:
+            estado = _status(error)
+            texto = str(error).lower()
+            if estado == 404:
+                continue
+            # 403 por falta de permiso sobre ESE archivo: se deja. Un 403 de límite de pedidos no.
+            if estado == 403 and "ratelimit" not in texto:
+                omitidas += 1
+                continue
+            raise
+
+    # Con lo movible ya afuera, se reintenta la carpeta: si sigue habiendo algo ajeno, se queda.
+    try:
+        drive_service.files().update(fileId=carpeta_id, body={"trashed": True}, fields="id").execute()
+    except HttpError as error:
+        if _status(error) == 404:
+            return omitidas
+        if _es_app_no_autorizada_a_hijo(error):
+            return omitidas + 1
+        raise
+    return omitidas
+
+
 @traducir_permisos_de_google("Google Drive")
 def enviar_docukids_a_papelera(user: User) -> int:
     """
     Manda a la PAPELERA de Drive la carpeta 'Docukids' del usuario (con ella van las
     carpetas de cada hijo y sus archivos). No borra nada para siempre: la persona puede
     recuperarlo desde la papelera durante unos 30 días. Si 'Docukids' no existe (la
-    borró a mano o nunca subió nada) no es error. Un 404 se ignora; cualquier otro
-    error se propaga para que el llamador NO borre nada de la base.
-    Devuelve cuántas carpetas mandó a la papelera.
+    borró a mano o nunca subió nada) no es error. Un 404 se ignora.
+    Si la carpeta tiene adentro algo que la app no puede tocar (403 appNotAuthorizedToChild),
+    se manda a la papelera lo que sí puede y se deja el resto.
+    Devuelve cuántos elementos quedaron SIN mover (0 = todo fue a la papelera).
+    Cualquier otro error se propaga para que el llamador NO borre nada de la base.
     """
     drive_service = _drive(user)
-    enviadas = 0
+    sin_mover = 0
     for carpeta_id in _buscar_carpetas_raiz(drive_service):
-        try:
-            drive_service.files().update(
-                fileId=carpeta_id, body={"trashed": True}, fields="id"
-            ).execute()
-            enviadas += 1
-        except HttpError as error:
-            if _status(error) != 404:
-                raise
-    return enviadas
+        sin_mover += _a_papelera_lo_que_se_pueda(drive_service, carpeta_id)
+    return sin_mover
 
 
 # ---------------------------------------------------------------------------
