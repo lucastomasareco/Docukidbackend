@@ -520,7 +520,7 @@ async def update_appointment(
     latitude: Optional[float] = None,
     longitude: Optional[float] = None,
 ) -> Appointment:
-    """Guarda los valores FINALES del turno (PATCH /appointments/{id}), lugar incluido."""
+    """Guarda los valores FINALES del turno (PATCH /appointments/{id})."""
     appointment.title = title
     appointment.date = date_
     appointment.time = time_

@@ -34,6 +34,8 @@ DELETE /family/members/{id}    -> el titular quita al miembro
 DELETE /family                 -> el titular disuelve la familia
 DELETE /account                -> elimina la cuenta: datos de la app + usuario de Supabase Auth. ?delete_drive=true manda 'Docukids' a la papelera de Drive (por defecto false: Drive se conserva). Calendar NO se toca
 GET    /appointments/{child_id} -> lista los turnos de un hijo
+GET    /places/search?q=       -> busca un lugar (Nominatim/OpenStreetMap) (v2.7)
+GET    /places/reverse?lat=&lon= -> dirección de un punto del mapa (v2.7)
 POST   /scheduler/check         -> lo llama cron-job.org 1 vez al día; manda los avisos pendientes
 /upload ahora hace, en este orden: valida el hijo y el tipo de archivo,
 sube el archivo a Drive (drive_upload.py), y le pasa el archivo a Gemini
@@ -92,9 +94,9 @@ from .drive_upload import (
     upload_file_to_child_folder,
 )
 from .google_oauth import router as google_oauth_router
-from .places import router as places_router
 from .models import User
 from .ocr_reader import leer_fecha_de_vencimiento
+from .places import router as places_router
 from .scheduler import router as scheduler_router
 from .schemas import (
     AppointmentCreate,
@@ -135,7 +137,7 @@ from .schemas import (
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Docukids API", version="2.6.0")
+app = FastAPI(title="Docukids API", version="2.7.0")
 
 # La app móvil no corre en un navegador con las mismas reglas que una web,
 # pero dejamos CORS abierto para no tener sorpresas si en algún momento se
@@ -153,8 +155,8 @@ app.add_middleware(
 )
 
 app.include_router(google_oauth_router)
-app.include_router(places_router)
 app.include_router(scheduler_router)
+app.include_router(places_router)
 
 @app.get("/")
 async def raiz():
@@ -1263,7 +1265,7 @@ async def crear_turno(
         fecha=datos.date,
         hora=datos.time,
         notes=datos.notes,
-        location=texto_de_lugar(datos.location_name, datos.address),
+        lugar=texto_de_lugar(datos.location_name, datos.address),
     )
     await crud.create_appointment(
         db,
@@ -1273,8 +1275,8 @@ async def crear_turno(
         time_=datos.time,
         notes=datos.notes,
         calendar_event_id=calendar_event_id,
-        location_name=datos.location_name,
-        address=datos.address,
+        location_name=(datos.location_name or "").strip() or None,
+        address=(datos.address or "").strip() or None,
         latitude=datos.latitude,
         longitude=datos.longitude,
     )
@@ -1323,11 +1325,14 @@ async def actualizar_turno(
     notas = cambios["notes"] if "notes" in cambios else turno.notes
     if notas is not None:
         notas = notas.strip() or None
-    # Lugar (v2.7): lo que no se manda queda como estaba; cuatro null lo quitan.
+
+    # Lugar (v2.7): lo que no se manda queda como estaba; los cuatro en null lo quitan.
     nombre_lugar = cambios["location_name"] if "location_name" in cambios else turno.location_name
     direccion = cambios["address"] if "address" in cambios else turno.address
     latitud = cambios["latitude"] if "latitude" in cambios else turno.latitude
     longitud = cambios["longitude"] if "longitude" in cambios else turno.longitude
+    nombre_lugar = (nombre_lugar or "").strip() or None
+    direccion = (direccion or "").strip() or None
 
     calendar_event_id = await run_in_threadpool(
         actualizar_evento,
@@ -1337,7 +1342,7 @@ async def actualizar_turno(
         fecha=fecha,
         hora=hora,
         notes=notas,
-        location=texto_de_lugar(nombre_lugar, direccion),
+        lugar=texto_de_lugar(nombre_lugar, direccion),
     )
     turno = await crud.update_appointment(
         db,

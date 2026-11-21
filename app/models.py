@@ -208,7 +208,7 @@ class Appointment(Base):
     time = Column(Time, nullable=True)
     notes = Column(Text, nullable=True)
     calendar_event_id = Column(Text, nullable=True)  # Se completa en Fase 2 (calendar_sync.py)
-    # Lugar del turno (v2.7). Todos opcionales; latitude y longitude van juntas o ninguna.
+    # Lugar del turno (v2.7): todo opcional. Migración: add_appointment_location.sql
     location_name = Column(Text, nullable=True)
     address = Column(Text, nullable=True)
     latitude = Column(Float, nullable=True)

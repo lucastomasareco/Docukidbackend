@@ -304,27 +304,14 @@ class RecoverResponse(BaseModel):
 
 # ---------- Turnos (appointments) ----------
 
-# Lugar del turno (v2.7): nombre, dirección y coordenadas, todo opcional.
-LUGAR_TEXTO_MAX = 300
-
-
-def _limpiar_texto_lugar(valor: Optional[str]) -> Optional[str]:
-    if valor is None:
-        return None
-    valor = valor.strip()
-    if len(valor) > LUGAR_TEXTO_MAX:
-        raise ValueError(f"El texto del lugar es demasiado largo (máximo {LUGAR_TEXTO_MAX} caracteres).")
-    return valor or None
-
-
-def _validar_coordenadas(latitude: Optional[float], longitude: Optional[float]) -> None:
-    if (latitude is None) != (longitude is None):
-        raise ValueError("Mandá latitud y longitud juntas, o ninguna de las dos.")
-    if latitude is not None:
-        if not -90 <= latitude <= 90:
-            raise ValueError("La latitud tiene que estar entre -90 y 90.")
-        if not -180 <= longitude <= 180:
-            raise ValueError("La longitud tiene que estar entre -180 y 180.")
+def _validar_coordenadas(lat: Optional[float], lon: Optional[float]) -> None:
+    """Lugar del turno (v2.7): latitud -90..90, longitud -180..180, y las dos o ninguna."""
+    if (lat is None) != (lon is None):
+        raise ValueError("La ubicación necesita latitud y longitud juntas (o ninguna).")
+    if lat is not None and not (-90 <= lat <= 90):
+        raise ValueError("La latitud tiene que estar entre -90 y 90.")
+    if lon is not None and not (-180 <= lon <= 180):
+        raise ValueError("La longitud tiene que estar entre -180 y 180.")
 
 
 class AppointmentCreate(BaseModel):
@@ -333,15 +320,11 @@ class AppointmentCreate(BaseModel):
     date: date
     time: Optional[dt_time] = None
     notes: Optional[str] = None
-    location_name: Optional[str] = None
-    address: Optional[str] = None
+    # Lugar (v2.7): todo opcional.
+    location_name: Optional[str] = Field(default=None, max_length=200)
+    address: Optional[str] = Field(default=None, max_length=300)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-
-    @field_validator("location_name", "address")
-    @classmethod
-    def _texto_lugar(cls, v):
-        return _limpiar_texto_lugar(v)
 
     @model_validator(mode="after")
     def _validar_lugar(self):
@@ -362,24 +345,18 @@ class AppointmentUpdate(BaseModel):
       - date: no puede ser null.
       - time: "HH:MM" para fijar hora; null para quitarla (el evento pasa a ser de todo el día).
       - notes: texto, o null / "" para borrarlas.
-      - location_name, address, latitude, longitude (v2.7): el lugar del turno.
-        Latitud y longitud se mandan juntas. Para QUITAR el lugar se mandan los
-        cuatro en null.
+      - location_name, address, latitude, longitude (v2.7): el lugar. Para quitarlo se
+        mandan los cuatro en null. latitude y longitude van juntas (las dos o ninguna).
     Un cuerpo vacío ({}) se rechaza con 422.
     """
     title: Optional[str] = None
     date: Optional[date_type] = None
     time: Optional[dt_time] = None
     notes: Optional[str] = None
-    location_name: Optional[str] = None
-    address: Optional[str] = None
+    location_name: Optional[str] = Field(default=None, max_length=200)
+    address: Optional[str] = Field(default=None, max_length=300)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-
-    @field_validator("location_name", "address")
-    @classmethod
-    def _texto_lugar(cls, v):
-        return _limpiar_texto_lugar(v)
 
     @model_validator(mode="after")
     def _validar_cambios(self):
@@ -390,9 +367,8 @@ class AppointmentUpdate(BaseModel):
             raise ValueError("El título no puede estar vacío.")
         if "date" in enviados and self.date is None:
             raise ValueError("La fecha no puede ser null.")
-        # Lugar: las coordenadas se mandan siempre las dos, o ninguna.
         if ("latitude" in enviados) != ("longitude" in enviados):
-            raise ValueError("Mandá latitud y longitud juntas, o ninguna de las dos.")
+            raise ValueError("Mandá latitude y longitude juntas.")
         _validar_coordenadas(self.latitude, self.longitude)
         return self
 
