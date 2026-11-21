@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     notification_threshold_days: int = 15
     app_timezone: str = "America/Argentina/Buenos_Aires"
     appointment_timezone: str = "America/Argentina/Buenos_Aires"
+    # Buscador de lugares (v2.7, Nominatim/OpenStreetMap). La política de uso de
+    # Nominatim exige identificar la aplicación con un User-Agent propio.
+    nominatim_user_agent: str = "Docukids/2.7 (proyecto de catedra)"
 
     @classmethod
     def settings_customise_sources(

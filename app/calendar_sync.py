@@ -48,7 +48,28 @@ TIMEZONE = settings.appointment_timezone
 DURACION_TURNO_MINUTOS = 30
 
 
-def _armar_cuerpo_evento(title: str, fecha: date_type, hora: Optional[time_type], notes: Optional[str]) -> dict:
+def texto_de_lugar(nombre: Optional[str], direccion: Optional[str]) -> Optional[str]:
+    """
+    Texto que va en el campo "ubicación" del evento de Google Calendar (v2.7):
+    "Nombre, dirección". Si la dirección ya empieza con el nombre, no se repite.
+    Devuelve None si no hay ninguno de los dos.
+    """
+    nombre = (nombre or "").strip()
+    direccion = (direccion or "").strip()
+    if nombre and direccion:
+        if direccion.lower().startswith(nombre.lower()):
+            return direccion
+        return f"{nombre}, {direccion}"
+    return nombre or direccion or None
+
+
+def _armar_cuerpo_evento(
+    title: str,
+    fecha: date_type,
+    hora: Optional[time_type],
+    notes: Optional[str],
+    location: Optional[str] = None,
+) -> dict:
     """
     Si viene una hora, creamos un evento con horario (dateTime + timeZone).
     Si NO viene hora, lo creamos como evento "de todo el día" (date, sin
@@ -58,19 +79,24 @@ def _armar_cuerpo_evento(title: str, fecha: date_type, hora: Optional[time_type]
     if hora is not None:
         inicio = datetime.combine(fecha, hora)
         fin = inicio + timedelta(minutes=DURACION_TURNO_MINUTOS)
-        return {
+        cuerpo = {
             "summary": title,
             "description": notes or "",
             "start": {"dateTime": inicio.isoformat(), "timeZone": TIMEZONE},
             "end": {"dateTime": fin.isoformat(), "timeZone": TIMEZONE},
         }
-
-    return {
-        "summary": title,
-        "description": notes or "",
-        "start": {"date": fecha.isoformat()},
-        "end": {"date": fecha.isoformat()},
-    }
+    else:
+        cuerpo = {
+            "summary": title,
+            "description": notes or "",
+            "start": {"date": fecha.isoformat()},
+            "end": {"date": fecha.isoformat()},
+        }
+    # events().update reemplaza el evento entero: si no hay lugar, el campo se
+    # omite y Google lo borra, que es justo lo que se quiere al quitar el lugar.
+    if location:
+        cuerpo["location"] = location
+    return cuerpo
 
 
 @traducir_permisos_de_google("Google Calendar")
@@ -80,6 +106,7 @@ def crear_evento(
     fecha: date_type,
     hora: Optional[time_type],
     notes: Optional[str],
+    location: Optional[str] = None,
 ) -> str:
     """
     Crea el evento en el Google Calendar del usuario (calendario "primary",
@@ -88,7 +115,7 @@ def crear_evento(
     credenciales = build_google_credentials(user, "Google Calendar")
     servicio = build("calendar", "v3", credentials=credenciales)
 
-    cuerpo_evento = _armar_cuerpo_evento(title, fecha, hora, notes)
+    cuerpo_evento = _armar_cuerpo_evento(title, fecha, hora, notes, location)
 
     evento_creado = (
         servicio.events()
@@ -106,6 +133,7 @@ def actualizar_evento(
     fecha: date_type,
     hora: Optional[time_type],
     notes: Optional[str],
+    location: Optional[str] = None,
 ) -> str:
     """
     Actualiza el evento en Google Calendar con los valores FINALES del turno y
@@ -118,12 +146,12 @@ def actualizar_evento(
 
     Usa events().update (reemplaza el evento entero), que es lo que permite pasar
     de "con hora" a "todo el día" y viceversa. Contra: si la persona agregó a mano
-    en Google datos que la app no maneja (ubicación, invitados), se pierden al
+    en Google datos que la app no maneja (invitados, recordatorios), se pierden al
     editar el turno desde la app.
     """
     credenciales = build_google_credentials(user, "Google Calendar")
     servicio = build("calendar", "v3", credentials=credenciales)
-    cuerpo_evento = _armar_cuerpo_evento(title, fecha, hora, notes)
+    cuerpo_evento = _armar_cuerpo_evento(title, fecha, hora, notes, location)
 
     if calendar_event_id:
         try:

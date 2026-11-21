@@ -60,7 +60,7 @@ from . import crud
 from .account import borrar_usuario_de_auth, motivo_de_error, revocar_permiso_de_google
 from .auth import get_current_user, get_data_owner
 from .config import settings
-from .calendar_sync import actualizar_evento, crear_evento, borrar_evento
+from .calendar_sync import actualizar_evento, crear_evento, borrar_evento, texto_de_lugar
 from .database import get_db
 from .drive_recover import escanear_carpetas_recuperables, restaurar_carpeta_de_papelera
 from .drive_trash import (
@@ -92,6 +92,7 @@ from .drive_upload import (
     upload_file_to_child_folder,
 )
 from .google_oauth import router as google_oauth_router
+from .places import router as places_router
 from .models import User
 from .ocr_reader import leer_fecha_de_vencimiento
 from .scheduler import router as scheduler_router
@@ -152,6 +153,7 @@ app.add_middleware(
 )
 
 app.include_router(google_oauth_router)
+app.include_router(places_router)
 app.include_router(scheduler_router)
 
 @app.get("/")
@@ -1261,6 +1263,7 @@ async def crear_turno(
         fecha=datos.date,
         hora=datos.time,
         notes=datos.notes,
+        location=texto_de_lugar(datos.location_name, datos.address),
     )
     await crud.create_appointment(
         db,
@@ -1270,6 +1273,10 @@ async def crear_turno(
         time_=datos.time,
         notes=datos.notes,
         calendar_event_id=calendar_event_id,
+        location_name=datos.location_name,
+        address=datos.address,
+        latitude=datos.latitude,
+        longitude=datos.longitude,
     )
     return AppointmentCreatedResponse(ok=True, calendar_event_id=calendar_event_id)
 
@@ -1316,6 +1323,11 @@ async def actualizar_turno(
     notas = cambios["notes"] if "notes" in cambios else turno.notes
     if notas is not None:
         notas = notas.strip() or None
+    # Lugar (v2.7): lo que no se manda queda como estaba; cuatro null lo quitan.
+    nombre_lugar = cambios["location_name"] if "location_name" in cambios else turno.location_name
+    direccion = cambios["address"] if "address" in cambios else turno.address
+    latitud = cambios["latitude"] if "latitude" in cambios else turno.latitude
+    longitud = cambios["longitude"] if "longitude" in cambios else turno.longitude
 
     calendar_event_id = await run_in_threadpool(
         actualizar_evento,
@@ -1325,6 +1337,7 @@ async def actualizar_turno(
         fecha=fecha,
         hora=hora,
         notes=notas,
+        location=texto_de_lugar(nombre_lugar, direccion),
     )
     turno = await crud.update_appointment(
         db,
@@ -1334,6 +1347,10 @@ async def actualizar_turno(
         time_=hora,
         notes=notas,
         calendar_event_id=calendar_event_id,
+        location_name=nombre_lugar,
+        address=direccion,
+        latitude=latitud,
+        longitude=longitud,
     )
     return AppointmentOut.model_validate(turno)
 

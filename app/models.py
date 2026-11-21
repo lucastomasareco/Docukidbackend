@@ -16,7 +16,7 @@ mismo cambio acá a mano.
 
 import uuid
 
-from sqlalchemy import Boolean, Column, Integer, Text, Date, Time, TIMESTAMP, ForeignKey, func, text
+from sqlalchemy import Boolean, Column, Float, Integer, Text, Date, Time, TIMESTAMP, ForeignKey, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
@@ -208,6 +208,11 @@ class Appointment(Base):
     time = Column(Time, nullable=True)
     notes = Column(Text, nullable=True)
     calendar_event_id = Column(Text, nullable=True)  # Se completa en Fase 2 (calendar_sync.py)
+    # Lugar del turno (v2.7). Todos opcionales; latitude y longitude van juntas o ninguna.
+    location_name = Column(Text, nullable=True)
+    address = Column(Text, nullable=True)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
 
     child = relationship("Child", back_populates="appointments")

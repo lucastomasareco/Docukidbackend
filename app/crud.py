@@ -469,6 +469,10 @@ async def create_appointment(
     time_: Optional[time],
     notes: Optional[str],
     calendar_event_id: str,
+    location_name: Optional[str] = None,
+    address: Optional[str] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
 ) -> Appointment:
     appointment = Appointment(
         child_id=child_id,
@@ -477,6 +481,10 @@ async def create_appointment(
         time=time_,
         notes=notes,
         calendar_event_id=calendar_event_id,
+        location_name=location_name,
+        address=address,
+        latitude=latitude,
+        longitude=longitude,
     )
     db.add(appointment)
     await db.commit()
@@ -507,13 +515,21 @@ async def update_appointment(
     time_: Optional[time],
     notes: Optional[str],
     calendar_event_id: str,
+    location_name: Optional[str] = None,
+    address: Optional[str] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
 ) -> Appointment:
-    """Guarda los valores FINALES del turno (PATCH /appointments/{id})."""
+    """Guarda los valores FINALES del turno (PATCH /appointments/{id}), lugar incluido."""
     appointment.title = title
     appointment.date = date_
     appointment.time = time_
     appointment.notes = notes
     appointment.calendar_event_id = calendar_event_id
+    appointment.location_name = location_name
+    appointment.address = address
+    appointment.latitude = latitude
+    appointment.longitude = longitude
     await db.commit()
     await db.refresh(appointment)
     return appointment
