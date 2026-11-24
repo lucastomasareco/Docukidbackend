@@ -830,7 +830,7 @@ async def restaurar_documento_borrado(
 # ---------- /folders ----------
 # Familias (v2.5): igual que en /children y /documents, `usuario` es el DUEÑO DE
 # LOS DATOS (get_data_owner). Las carpetas son las del titular, y también sus
-# subcarpetas en Drive: las dos personas de la familia ven y editan las mismas.
+# subcarpetas en Drive: las personas de la familia ven y editan las mismas.
 async def _carpeta_propia_o_404(db: AsyncSession, folder_id: int, user_id):
     carpeta = await crud.get_folder_owned_by_user(db, folder_id, user_id)
     if carpeta is None:
@@ -1553,7 +1553,7 @@ async def unirse_a_la_familia(
     """
     Unirse a una familia con un código. Reglas (Guía §12):
       - Código inexistente, vencido o ya usado: 404 (no se distingue).
-      - Familia con 2 personas: 409.
+      - Familia completa (crud.MAX_FAMILIA personas): 409.
       - Si la persona ya tiene hijos propios: 409 (para no perderlos sin querer).
       - Si tenía Google conectado por su cuenta, se desconecta: desde ahora usa el del titular.
     El código no se escribe en ningún log.
@@ -1577,7 +1577,7 @@ async def unirse_a_la_familia(
     if len(miembros) >= crud.MAX_FAMILIA:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Esa familia ya está completa (máximo 2 personas).",
+            detail=f"Esa familia ya está completa (máximo {crud.MAX_FAMILIA} personas).",
         )
     if await crud.user_has_own_data(db, usuario.id):
         raise HTTPException(

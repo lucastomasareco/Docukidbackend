@@ -678,7 +678,7 @@ async def delete_user(db: AsyncSession, user: User) -> None:
 _ALFABETO_CODIGO = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 CODIGO_LARGO = 6
 CODIGO_HORAS_DE_VALIDEZ = 24
-MAX_FAMILIA = 2  # titular + un miembro
+MAX_FAMILIA = 4  # titular + hasta tres miembros (el frontend tiene el mismo número en lib/familia.ts)
 
 
 def ahora_utc() -> datetime:
