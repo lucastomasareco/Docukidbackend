@@ -314,6 +314,23 @@ def _validar_coordenadas(lat: Optional[float], lon: Optional[float]) -> None:
         raise ValueError("La longitud tiene que estar entre -180 y 180.")
 
 
+class DocumentoDeTurno(BaseModel):
+    """Documento vinculado a un turno (lo mínimo para mostrarlo y abrirlo)."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    drive_link: Optional[str] = None
+    mime_type: Optional[str] = None
+
+
+def _limpiar_ids_documentos(ids: Optional[List[int]]) -> Optional[List[int]]:
+    """Sin repetidos (conserva el orden). None se queda en None."""
+    if ids is None:
+        return None
+    return list(dict.fromkeys(ids))
+
+
 class AppointmentCreate(BaseModel):
     child_id: int
     title: str
@@ -325,10 +342,15 @@ class AppointmentCreate(BaseModel):
     address: Optional[str] = Field(default=None, max_length=300)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    # Documentos de Docs del mismo niño que se vinculan al turno (opcional).
+    document_ids: Optional[List[int]] = Field(default=None, max_length=20)
 
     @model_validator(mode="after")
     def _validar_lugar(self):
         _validar_coordenadas(self.latitude, self.longitude)
+        # Solo si vino: asignar un campo lo marcaría como "enviado" y, al editar, borraría los vínculos.
+        if "document_ids" in self.model_fields_set:
+            self.document_ids = _limpiar_ids_documentos(self.document_ids)
         return self
 
 
@@ -347,6 +369,8 @@ class AppointmentUpdate(BaseModel):
       - notes: texto, o null / "" para borrarlas.
       - location_name, address, latitude, longitude (v2.7): el lugar. Para quitarlo se
         mandan los cuatro en null. latitude y longitude van juntas (las dos o ninguna).
+      - document_ids: la lista COMPLETA de documentos vinculados (reemplaza a la anterior).
+        [] o null los desvincula a todos. Si no se manda, quedan como estaban.
     Un cuerpo vacío ({}) se rechaza con 422.
     """
     title: Optional[str] = None
@@ -357,6 +381,7 @@ class AppointmentUpdate(BaseModel):
     address: Optional[str] = Field(default=None, max_length=300)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    document_ids: Optional[List[int]] = Field(default=None, max_length=20)
 
     @model_validator(mode="after")
     def _validar_cambios(self):
@@ -370,6 +395,9 @@ class AppointmentUpdate(BaseModel):
         if ("latitude" in enviados) != ("longitude" in enviados):
             raise ValueError("Mandá latitude y longitude juntas.")
         _validar_coordenadas(self.latitude, self.longitude)
+        # Solo si vino: asignar un campo lo marcaría como "enviado" y, al editar, borraría los vínculos.
+        if "document_ids" in self.model_fields_set:
+            self.document_ids = _limpiar_ids_documentos(self.document_ids)
         return self
 
 
@@ -386,6 +414,8 @@ class AppointmentOut(BaseModel):
     address: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    # Documentos vinculados (vacío si no tiene). Los arma el endpoint, no la tabla del turno.
+    documents: List[DocumentoDeTurno] = Field(default_factory=list)
 
 
 class AppointmentsResponse(BaseModel):

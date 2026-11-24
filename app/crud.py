@@ -19,7 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import settings
-from .models import Appointment, Child, ChildFolder, Document, Family, Folder, User
+from .models import Appointment, AppointmentDocument, Child, ChildFolder, Document, Family, Folder, User
 
 
 # ---------- Configuración de zona horaria ----------
@@ -543,6 +543,50 @@ async def delete_appointment(db: AsyncSession, appointment: Appointment) -> None
 async def get_appointments_by_child(db: AsyncSession, child_id: int) -> Sequence[Appointment]:
     result = await db.execute(select(Appointment).where(Appointment.child_id == child_id))
     return result.scalars().all()
+
+
+# ---------- Documentos vinculados a un turno ----------
+
+async def get_documents_of_child_by_ids(
+    db: AsyncSession, child_id: int, document_ids: Sequence[int]
+) -> Sequence[Document]:
+    """Los documentos de ESE niño con esos ids. Los que no existan o sean de otro niño no vuelven."""
+    if not document_ids:
+        return []
+    result = await db.execute(
+        select(Document).where(Document.child_id == child_id, Document.id.in_(list(document_ids)))
+    )
+    return result.scalars().all()
+
+
+async def get_documents_by_appointments(
+    db: AsyncSession, appointment_ids: Sequence[int]
+) -> dict[int, list[Document]]:
+    """{id_de_turno: [documentos]} en una sola consulta (los turnos sin documentos no aparecen)."""
+    if not appointment_ids:
+        return {}
+    result = await db.execute(
+        select(AppointmentDocument.appointment_id, Document)
+        .join(Document, Document.id == AppointmentDocument.document_id)
+        .where(AppointmentDocument.appointment_id.in_(list(appointment_ids)))
+        .order_by(AppointmentDocument.created_at, Document.id)
+    )
+    por_turno: dict[int, list[Document]] = {}
+    for turno_id, documento in result.all():
+        por_turno.setdefault(turno_id, []).append(documento)
+    return por_turno
+
+
+async def set_appointment_documents(
+    db: AsyncSession, appointment_id: int, document_ids: Sequence[int]
+) -> None:
+    """Deja vinculados EXACTAMENTE esos documentos (reemplaza lo anterior). Hace commit."""
+    await db.execute(
+        delete(AppointmentDocument).where(AppointmentDocument.appointment_id == appointment_id)
+    )
+    for doc_id in document_ids:
+        db.add(AppointmentDocument(appointment_id=appointment_id, document_id=doc_id))
+    await db.commit()
 
 
 # ---------- Scheduler (avisos de vencimiento) ----------

@@ -111,6 +111,7 @@ from .schemas import (
     ChildUpdate,
     DeleteResponse,
     DocumentOut,
+    DocumentoDeTurno,
     DocumentsResponse,
     DocumentUpdate,
     FamilyJoin,
@@ -1242,6 +1243,28 @@ async def recuperar_datos(
 # Familias (v2.5): igual que en los grupos anteriores, `usuario` es el DUEÑO DE
 # LOS DATOS (get_data_owner). Los turnos son los del titular y los eventos se
 # crean, editan y borran en el Google Calendar del titular.
+async def _turnos_con_documentos(db: AsyncSession, turnos) -> list:
+    """AppointmentOut de cada turno, con sus documentos vinculados (una sola consulta para todos)."""
+    por_turno = await crud.get_documents_by_appointments(db, [t.id for t in turnos])
+    salida = []
+    for t in turnos:
+        out = AppointmentOut.model_validate(t)
+        out.documents = [DocumentoDeTurno.model_validate(d) for d in por_turno.get(t.id, [])]
+        salida.append(out)
+    return salida
+
+
+async def _documentos_validos_del_hijo(db: AsyncSession, child_id: int, ids):
+    """Los documentos a vincular tienen que ser del MISMO niño del turno; si alguno no lo es, 404."""
+    documentos = await crud.get_documents_of_child_by_ids(db, child_id, ids)
+    if len(documentos) != len(set(ids)):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Algún documento no existe o no es de este niño",
+        )
+    return documentos
+
+
 @app.post("/appointments", response_model=AppointmentCreatedResponse)
 async def crear_turno(
     datos: AppointmentCreate,
@@ -1254,7 +1277,11 @@ async def crear_turno(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Ese child_id no existe o no pertenece a tu usuario",
         )
-    
+
+    # Documentos vinculados: se validan ANTES de crear el evento en Google (si fallan, no queda nada a medias).
+    if datos.document_ids:
+        await _documentos_validos_del_hijo(db, datos.child_id, datos.document_ids)
+
     # --- Fase 2, paso 4: evento real en Google Calendar ---
     # Si el usuario todavía no conectó su cuenta de Google, crear_evento
     # levanta un HTTPException 400 clara (ver calendar_sync.py).
@@ -1267,7 +1294,7 @@ async def crear_turno(
         notes=datos.notes,
         lugar=texto_de_lugar(datos.location_name, datos.address),
     )
-    await crud.create_appointment(
+    turno_nuevo = await crud.create_appointment(
         db,
         child_id=datos.child_id,
         title=datos.title,
@@ -1280,6 +1307,8 @@ async def crear_turno(
         latitude=datos.latitude,
         longitude=datos.longitude,
     )
+    if datos.document_ids:
+        await crud.set_appointment_documents(db, turno_nuevo.id, datos.document_ids)
     return AppointmentCreatedResponse(ok=True, calendar_event_id=calendar_event_id)
 
 @app.get("/appointments/{child_id}", response_model=AppointmentsResponse)
@@ -1296,7 +1325,7 @@ async def listar_turnos(
         )
     
     turnos = await crud.get_appointments_by_child(db, child_id)
-    return AppointmentsResponse(appointments=[AppointmentOut.model_validate(t) for t in turnos])
+    return AppointmentsResponse(appointments=await _turnos_con_documentos(db, turnos))
 
 
 @app.patch("/appointments/{appointment_id}", response_model=AppointmentOut)
@@ -1334,6 +1363,12 @@ async def actualizar_turno(
     nombre_lugar = (nombre_lugar or "").strip() or None
     direccion = (direccion or "").strip() or None
 
+    # Documentos vinculados: solo si vino document_ids (lista completa; [] o null = desvincular todos).
+    cambiar_documentos = "document_ids" in cambios
+    ids_documentos = list(cambios.get("document_ids") or [])
+    if cambiar_documentos and ids_documentos:
+        await _documentos_validos_del_hijo(db, turno.child_id, ids_documentos)
+
     calendar_event_id = await run_in_threadpool(
         actualizar_evento,
         user=usuario,
@@ -1357,7 +1392,9 @@ async def actualizar_turno(
         latitude=latitud,
         longitude=longitud,
     )
-    return AppointmentOut.model_validate(turno)
+    if cambiar_documentos:
+        await crud.set_appointment_documents(db, turno.id, ids_documentos)
+    return (await _turnos_con_documentos(db, [turno]))[0]
 
 
 @app.delete("/appointments/{appointment_id}", response_model=DeleteResponse)

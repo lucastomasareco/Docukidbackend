@@ -220,3 +220,16 @@ class Appointment(Base):
     # NOTA: el modelo ya está listo porque la tabla existe desde el script SQL,
     # pero el endpoint /appointments NO se implementa todavía: según el plan de
     # construcción (Fase 2, paso 4) depende de calendar_sync.py, que viene después.
+
+
+class AppointmentDocument(Base):
+    """
+    Documento vinculado a un turno. Migración: add_appointment_documents.sql.
+    Las dos claves son ON DELETE CASCADE en la base: al borrar el documento (o el
+    turno), el vínculo desaparece solo. Por eso no hay relationship() acá.
+    """
+    __tablename__ = "appointment_documents"
+
+    appointment_id = Column(Integer, ForeignKey("appointments.id", ondelete="CASCADE"), primary_key=True)
+    document_id = Column(Integer, ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True)
+    created_at = Column(TIMESTAMP, server_default=func.now())
